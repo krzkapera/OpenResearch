@@ -359,41 +359,75 @@ async fn ssh_run_file(
 }
 
 /// Upload a content-addressed tar once, then materialize it into this run's
-/// private `repo/` directory. Both the cache write and extraction are safe to
-/// repeat after a client or supervisor restart.
+/// private `repo/` directory under the default `~/.orx` remote root. Both the
+/// cache write and extraction are safe to repeat after a client or supervisor
+/// restart.
 pub async fn stage_source(
     target: &SshTarget,
     run_id: &str,
     archive: &std::path::Path,
     digest: &str,
 ) -> Result<String> {
-    let dir = format!(".orx/runs/{run_id}");
-    let cache = format!(".orx/source/{digest}.tar");
+    stage_source_at(target, run_id, archive, digest, ".orx").await
+}
+
+/// Like [`stage_source`], but places cache + run dirs under `remote_root`
+/// (home-relative like `scratch/.orx`, or absolute like `/mnt/scratch/.orx`).
+pub async fn stage_source_at(
+    target: &SshTarget,
+    run_id: &str,
+    archive: &std::path::Path,
+    digest: &str,
+    remote_root: &str,
+) -> Result<String> {
+    let root = remote_root.trim().trim_end_matches('/');
+    let dir = format!("{root}/runs/{run_id}");
+    let cache = format!("{root}/source/{digest}.tar");
+    let root_shell = remote_fs_path(root);
+    let dir_shell = remote_fs_path(&dir);
+    let cache_shell = remote_fs_path(&cache);
     let present = ssh_run(
         target,
-        &format!("test -f \"$HOME/{cache}\" && echo present || true"),
+        &format!("test -f {cache_shell} && echo present || true"),
         None,
     )
     .await?;
     if present.trim() != "present" {
-        let upload = format!(
-            "umask 077; mkdir -p \"$HOME/.orx/source\"; \
-             tmp=\"$HOME/{cache}.tmp.$$\"; cat > \"$tmp\" && mv \"$tmp\" \"$HOME/{cache}\""
-        );
+        let upload = if cache.starts_with('/') {
+            format!(
+                "umask 077; mkdir -p {root_shell}/source; \
+                 tmp=\"{cache}.tmp.$$\"; cat > \"$tmp\" && mv \"$tmp\" {cache_shell}"
+            )
+        } else {
+            format!(
+                "umask 077; mkdir -p {root_shell}/source; \
+                 tmp=\"$HOME/{cache}.tmp.$$\"; cat > \"$tmp\" && mv \"$tmp\" {cache_shell}"
+            )
+        };
         ssh_run_file(target, &upload, archive).await?;
     }
     ssh_run(
         target,
         &format!(
-            "umask 077; mkdir -p \"$HOME/.orx/runs\" \"$HOME/{dir}/repo\"; \
-             chmod 700 \"$HOME/.orx/runs\" \"$HOME/{dir}\" \"$HOME/{dir}/repo\"; \
-             tar -xf \"$HOME/{cache}\" -C \"$HOME/{dir}/repo\""
+            "umask 077; mkdir -p {root_shell}/runs {dir_shell}/repo; \
+             chmod 700 {root_shell}/runs {dir_shell} {dir_shell}/repo; \
+             tar -xf {cache_shell} -C {dir_shell}/repo"
         ),
         None,
     )
     .await?;
     Ok(dir)
 }
+
+/// Shell-quoted remote filesystem path: `$HOME/rel` or an absolute path.
+pub(crate) fn remote_fs_path(dir: &str) -> String {
+    if dir.starts_with('/') {
+        format!("\"{dir}\"")
+    } else {
+        format!("\"$HOME/{dir}\"")
+    }
+}
+
 
 /// Single-quote a value for safe embedding in the remote bash script.
 pub(crate) fn sh_quote(s: &str) -> String {
@@ -506,11 +540,20 @@ pub async fn stream_logs(
     _idle: Duration,
     sink: &mut (dyn FnMut(&str) + Send),
 ) -> Result<u64> {
-    let cmd = format!(
-        "tail -n +{} \"$HOME/{}/log\" 2>/dev/null || true",
-        skip + 1,
-        dir
-    );
+    let cmd = if dir.starts_with('/') {
+        format!(
+            "tail -n +{} \"{}/log\" 2>/dev/null || true",
+            skip + 1,
+            dir
+        )
+    } else {
+        format!(
+            "tail -n +{} \"$HOME/{}/log\" 2>/dev/null || true",
+            skip + 1,
+            dir
+        )
+    };
+
     let out = ssh_run(target, &cmd, None).await?;
     let mut seen = skip;
     // A trailing newline yields a final empty element under split('\n'); use

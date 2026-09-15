@@ -904,6 +904,7 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
       && partition.trim() === (previous.partition ?? "")
       && account.trim() === (previous.account ?? "")
       && timeLimit.trim() === (previous.timeLimit ?? "")
+      && remoteRoot.trim() === (previous.remoteRoot || "~/scratch/.orx")
     ))) {
       setHost(settings.host ?? "");
       setPartition(settings.partition ?? "");
@@ -931,6 +932,7 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
           partition: partition.trim(),
           account: account.trim(),
           timeLimit: timeLimit.trim(),
+          remoteRoot: remoteRoot.trim(),
         }),
       );
     } catch (err) {
@@ -1049,6 +1051,16 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
                 />
               </label>
             </div>
+                                    <label>
+              Remote root
+              <Input
+                value={remoteRoot}
+                onChange={(e) => setRemoteRoot(e.target.value)}
+                placeholder="~/scratch/.orx"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
             {error && <div className="error">{error}</div>}
             <div className="actions">
               <Button variant="primary" type="submit" disabled={saving || unchanged || connecting}>

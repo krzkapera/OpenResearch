@@ -1,15 +1,14 @@
 //! Local Slurm launch — the scheduler-backed twin of `local/ssh.rs`: submit
 //! the experiment as a batch job on a Slurm cluster reached via its login
 //! node. `--host` names an `~/.ssh/config` alias (defaultable in the slurm
-//! settings); `--flavor` asks for GPUs as a GRES spec. The run row lives in
-//! the local store only; a detached `orx supervise` watches the job.
-
-use std::collections::HashMap;
+//! settings). The agent authors `job.sbatch` in the experiment snapshot; orx
+//! stages it and submits with `sbatch`. The run row lives in the local store
+//! only; a detached `orx supervise` watches the job.
 
 use crate::commands::exp::spawn_detached_supervise;
 use crate::compute::SourceSnapshot;
 use crate::error::{anyhow, Result};
-use crate::jobs::{huggingface, slurm, BackendDescriptor};
+use crate::jobs::{slurm, BackendDescriptor};
 use crate::store::{now_ms, Store, StoredRun};
 
 /// CLI wrapper around `submit_local_slurm`: submit, then print the summary.
@@ -52,12 +51,13 @@ pub async fn submit_local_slurm_with_source(
         return Err(anyhow!("--manifest only applies with --backend k8s."));
     }
     // A muscle-memory `--flavor cpu` (HF/Modal habit) would become the
-    // nonsense GRES `gpu:cpu` and die with an opaque sbatch error.
+    // nonsense GRES `gpu:cpu` if ever applied. Flavor is optional and not
+    // required for submit (the agent's job.sbatch owns resource requests).
     if let Some(f) = &args.flavor {
         if f.trim().to_ascii_lowercase().starts_with("cpu") {
             return Err(anyhow!(
                 "--flavor names GPUs on --backend slurm (e.g. h100:2). For a CPU-only \
-                 run just omit --flavor; CPUs come from the partition defaults."
+                 run just omit --flavor; put CPU requests in job.sbatch instead."
             ));
         }
     }
@@ -73,12 +73,8 @@ pub async fn submit_local_slurm_with_source(
                  alias) or use a configured default Slurm host."
             )
         })?;
-
-    // `--timeout` beats the settings default; neither = the cluster's default.
-    let time_limit_secs = match args.timeout.as_deref().or(settings.time_limit.as_deref()) {
-        Some(t) => Some(huggingface::parse_timeout(t)?),
-        None => None,
-    };
+    let remote_root = slurm::effective_remote_root(&settings);
+    let remote_root_norm = slurm::normalize_remote_root(&remote_root);
 
     let store = Store::open()?;
     let exp = store
@@ -90,34 +86,27 @@ pub async fn submit_local_slurm_with_source(
     if let Some(w) = crate::local::experiments::legacy_root_warning(&project, &exp) {
         eprintln!("{w}");
     }
-    let run_command = Some(exp.run_command.clone())
+
+    // The experiment run_command is informational only for Slurm now — the
+    // agent-authored job.sbatch is the source of truth for what runs.
+    let command_label = Some(exp.run_command.clone())
         .filter(|c| !c.trim().is_empty())
         .or_else(|| project.run_command.clone().filter(|c| !c.trim().is_empty()))
-        .ok_or_else(|| anyhow!("{}", crate::invocation::no_run_command(&project.id)))?;
+        .unwrap_or_else(|| "job.sbatch".to_string());
 
-    // The job env: everything the user synced (API keys), plus the tokens the
-    // run step expects. Exported in the setup script and job.sbatch.
-    let mut env: HashMap<String, String> = crate::config::list_synced_env().into_iter().collect();
-    if let Ok(hf_token) = huggingface::resolve_token() {
-        env.entry("HF_TOKEN".to_string()).or_insert(hf_token);
-    }
-    crate::jobs::ssh::stage_source(
+    crate::jobs::ssh::stage_source_at(
         &crate::jobs::ssh::SshTarget::alias(&host),
         &run_id,
         &source.path,
         &source.digest,
+        &remote_root_norm,
     )
     .await?;
     let job_id = slurm::run_job(&slurm::SlurmJobSpec {
         host: host.clone(),
         run_id: run_id.clone(),
-        setup_script: "test -d repo".to_string(),
-        command: run_command.clone(),
-        env,
-        gres: args.flavor.as_deref().and_then(slurm::resolve_gres),
-        partition: settings.partition.clone(),
-        account: settings.account.clone(),
-        time_limit_secs,
+        remote_root: remote_root.clone(),
+        sbatch_path: "job.sbatch".to_string(),
     })
     .await?;
 
@@ -150,7 +139,7 @@ pub async fn submit_local_slurm_with_source(
         project_id: project.id.clone(),
         status: "starting".to_string(),
         backend_json: descriptor.to_json(),
-        command: run_command,
+        command: command_label,
         created_at: now_ms(),
         updated_at: now_ms(),
         ended_at: None,

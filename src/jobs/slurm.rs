@@ -7,28 +7,45 @@
 //! most users don't have, while everyone with a cluster account can ssh to
 //! the login node — the same trade SkyPilot makes.
 //!
-//! The remote layout extends the ssh backend's convention. A run owns
-//! `~/.orx/runs/<run_id>/` on the cluster's shared filesystem:
-//!   repo/       the experiment branch, cloned on the login node at submit
-//!               time (compute nodes often have no internet, so cloning
-//!               inside the job — the other backends' pattern — would break)
-//!   job.sbatch  the generated batch script (env exports + payload)
-//!   log         merged stdout/stderr, captured by Slurm via `--output`
-//!   exit_code   written by job.sbatch's closing lines when the payload ends
+//! ## Agent-authored `job.sbatch`
+//!
+//! After staging the snapshot into the remote run dir, orx looks for an
+//! agent-authored `job.sbatch` at the staged repo root and submits that file
+//! with `sbatch` from the run directory. orx does **not** generate the batch
+//! script from the experiment's run command or resource settings.
+//!
+//! Contract the agent must honour (relative paths resolve against the run
+//! dir, which is also sbatch's working directory):
+//!   `#SBATCH --output=log`
+//!   `#SBATCH --error=log`
+//!   write `exit_code` in the run dir when the payload finishes
+//!   (e.g. `echo "$code" > exit_code` from the run dir, or adjust if the
+//!   payload `cd`s into `repo/`)
+//!
+//! ## Remote layout
+//!
+//! Under the configurable remote root (default `~/scratch/.orx`, see
+//! `remoteRoot` in `slurm.json`):
+//!   source/     content-addressed snapshot tarballs
+//!   runs/<id>/
+//!     repo/       the staged experiment snapshot
+//!     log         merged stdout/stderr (`#SBATCH --output`/`--error`)
+//!     exit_code   written by the agent's job.sbatch when the payload ends
 //!
 //! The reattach handle is (host, slurm job id); the run dir derives from the
-//! run id. Job state is read exit_code-first (scheduler-independent truth,
-//! like the ssh backend), then `squeue` for live jobs, then `sacct` for jobs
-//! that left the queue without writing an exit code (scancel/timeout/node
-//! failure). `sacct` may be disabled cluster-wide, so it's a best-effort
-//! fallback, not a dependency.
-
-use std::collections::HashMap;
+//! run id + current `remoteRoot`. Job state is read exit_code-first
+//! (scheduler-independent truth, like the ssh backend), then `squeue` for
+//! live jobs, then `sacct` for jobs that left the queue without writing an
+//! exit code (scancel/timeout/node failure). `sacct` may be disabled
+//! cluster-wide, so it's a best-effort fallback, not a dependency.
 
 use serde::{Deserialize, Serialize};
 
-use super::ssh::{sh_quote, ssh_run, SshTarget};
+use super::ssh::{ssh_run, SshTarget};
 use crate::error::{anyhow, Result};
+
+/// Default remote base when `slurm.json` omits `remoteRoot`.
+pub const DEFAULT_REMOTE_ROOT: &str = "~/scratch/.orx";
 
 // --- settings ---------------------------------------------------------------
 
@@ -36,21 +53,30 @@ use crate::error::{anyhow, Result};
 /// `$XDG_CONFIG_HOME/openresearch/slurm.json`. No secrets in here — ssh
 /// holds all auth. Every field is optional: a bare `sbatch` on a
 /// single-partition cluster works with no configuration at all.
+///
+/// `partition` / `account` / `time_limit` remain available for UI/CLI
+/// convenience but are **not** applied at submit time — the agent's
+/// `job.sbatch` owns all `#SBATCH` directives.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlurmSettings {
     /// ssh config host alias of the login node; the `--host` default.
     #[serde(default)]
     pub host: Option<String>,
-    /// `#SBATCH --partition=…` default.
+    /// Optional partition hint (not applied to submit; agent owns `#SBATCH`).
     #[serde(default)]
     pub partition: Option<String>,
-    /// `#SBATCH --account=…` default (billing/allocation account).
+    /// Optional account hint (not applied to submit; agent owns `#SBATCH`).
     #[serde(default)]
     pub account: Option<String>,
-    /// `#SBATCH --time=…` default, in orx's duration syntax ("4h", "30m").
+    /// Optional time-limit hint (not applied to submit; agent owns `#SBATCH`).
     #[serde(default)]
     pub time_limit: Option<String>,
+    /// Remote base for source tarballs and run dirs. Default
+    /// `~/scratch/.orx`. Accepts `~/…`, `$HOME/…`, a home-relative path, or
+    /// an absolute path.
+    #[serde(default)]
+    pub remote_root: Option<String>,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -84,32 +110,54 @@ pub fn save_settings(settings: &SlurmSettings) -> Result<()> {
     Ok(())
 }
 
-// --- job spec & script generation --------------------------------------------
+/// Effective `remoteRoot` from settings (or the default).
+pub fn effective_remote_root(settings: &SlurmSettings) -> String {
+    settings
+        .remote_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_REMOTE_ROOT)
+        .to_string()
+}
+
+/// Strip a leading `~/` or `$HOME/` so the result is either absolute or
+/// home-relative (no trailing slash).
+pub fn normalize_remote_root(raw: &str) -> String {
+    let s = raw.trim();
+    let s = s
+        .strip_prefix("~/")
+        .or_else(|| s.strip_prefix("$HOME/"))
+        .or_else(|| (s == "~" || s == "$HOME").then_some(""))
+        .unwrap_or(s);
+    s.trim_end_matches('/').to_string()
+}
+
+/// Shell expression for a path under the remote root (`$HOME/…` or absolute).
+pub fn remote_path_shell(normalized_root_or_dir: &str) -> String {
+    if normalized_root_or_dir.starts_with('/') {
+        format!("\"{}\"", normalized_root_or_dir.replace('\"', "\\\""))
+    } else {
+        format!("\"$HOME/{normalized_root_or_dir}\"")
+    }
+}
+
+// --- job spec -----------------------------------------------------------------
 
 pub struct SlurmJobSpec {
     /// ssh config host alias of the cluster's login node.
     pub host: String,
-    /// Names the remote run dir `~/.orx/runs/<run_id>`.
+    /// Names the remote run dir `<remoteRoot>/runs/<run_id>`.
     pub run_id: String,
-    /// Runs on the login node in the run dir at submit time, with `env`
-    /// exported — the clone step. Piped to `bash -s`, never written to disk.
-    pub setup_script: String,
-    /// The experiment's run command; the body of the batch job (runs in
-    /// `repo/` on the compute node).
-    pub command: String,
-    /// Exported in both the setup script and job.sbatch (tokens, synced env).
-    pub env: HashMap<String, String>,
-    /// `#SBATCH --gres=…`, from `--flavor` (see `resolve_gres`).
-    pub gres: Option<String>,
-    pub partition: Option<String>,
-    pub account: Option<String>,
-    /// `#SBATCH --time=…` in seconds, from `--timeout` or settings.
-    pub time_limit_secs: Option<u64>,
+    /// Remote root as configured (tilde form ok; normalized at use sites).
+    pub remote_root: String,
+    /// Repo-relative path to the agent-authored batch script inside the
+    /// staged snapshot. Default `job.sbatch`.
+    pub sbatch_path: String,
 }
 
-/// Map a `--flavor` string onto a `--gres` request. A flavor names GPUs —
-/// CPU-only runs just omit it (unlike HF/Modal there is no machine shape to
-/// pick; partition + cluster defaults decide CPUs/memory).
+/// Map a `--flavor` string onto a `--gres` request. Kept for CLI/settings
+/// compatibility; submit no longer injects GRES into a generated script.
 ///   "gpu"      -> gpu:1
 ///   "gpu:…"    -> passed through verbatim (already a GRES spec)
 ///   "h100:2"   -> gpu:h100:2
@@ -129,7 +177,8 @@ pub fn resolve_gres(flavor: &str) -> Option<String> {
 }
 
 /// Seconds → Slurm's `--time` syntax (`D-HH:MM:SS` / `HH:MM:SS`).
-fn slurm_time(secs: u64) -> String {
+/// Kept for callers that still want to format a hint; not used at submit.
+pub fn slurm_time(secs: u64) -> String {
     let (days, rem) = (secs / 86_400, secs % 86_400);
     let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
     if days > 0 {
@@ -137,58 +186,6 @@ fn slurm_time(secs: u64) -> String {
     } else {
         format!("{h:02}:{m:02}:{s:02}")
     }
-}
-
-/// Render job.sbatch. Slurm captures the whole script's stdout/stderr to
-/// `log` (relative paths resolve against the submit-time cwd, the run dir,
-/// which sbatch also makes the job's working directory). The payload runs in
-/// a SUBSHELL so an `exit`/`set -e` inside it still reaches the
-/// `echo $? > exit_code` line — same contract as the ssh backend's run.sh.
-fn render_sbatch(spec: &SlurmJobSpec) -> String {
-    let mut directives = vec![
-        format!(
-            "#SBATCH --job-name=orx-{}",
-            &spec.run_id[..spec.run_id.len().min(8)]
-        ),
-        "#SBATCH --output=log".to_string(),
-        "#SBATCH --error=log".to_string(),
-        "#SBATCH --open-mode=append".to_string(),
-    ];
-    if let Some(secs) = spec.time_limit_secs {
-        directives.push(format!("#SBATCH --time={}", slurm_time(secs)));
-    }
-    if let Some(p) = spec.partition.as_deref().filter(|p| !p.trim().is_empty()) {
-        directives.push(format!("#SBATCH --partition={p}"));
-    }
-    if let Some(a) = spec.account.as_deref().filter(|a| !a.trim().is_empty()) {
-        directives.push(format!("#SBATCH --account={a}"));
-    }
-    if let Some(g) = spec.gres.as_deref() {
-        directives.push(format!("#SBATCH --gres={g}"));
-    }
-    // The script exits with the payload's code so Slurm's own COMPLETED/FAILED
-    // verdict mirrors the payload — inspect leans on that when the exit_code
-    // file is NFS-lagged behind the compute node's write.
-    // Default the payload's Python to unbuffered so its prints stream live
-    // instead of block-buffering behind Slurm's --output redirect. Only the
-    // sbatch payload runs the job — the login-node setup script (below) is a
-    // git clone, so it keeps the raw env (see jobs::default_python_env).
-    format!(
-        "#!/usr/bin/env bash\n{directives}\n{exports}\n(\ncd repo || exit 97\n{command}\n)\ncode=$?\necho \"$code\" > exit_code\nexit \"$code\"\n",
-        directives = directives.join("\n"),
-        exports = render_exports(&super::default_python_env(&spec.env)),
-        command = spec.command,
-    )
-}
-
-fn render_exports(env: &HashMap<String, String>) -> String {
-    let mut pairs: Vec<_> = env.iter().collect();
-    pairs.sort(); // deterministic script for tests & debugging
-    pairs
-        .iter()
-        .map(|(k, v)| format!("export {}={}", k, sh_quote(v)))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// `sbatch --parsable` prints `<jobid>` or `<jobid>;<cluster>`.
@@ -202,43 +199,68 @@ fn parse_job_id(out: &str) -> Result<String> {
 
 // --- lifecycle ----------------------------------------------------------------
 
-/// The remote run dir for a run, relative to `$HOME` (shared convention with
-/// the ssh backend; derived, not stored in the descriptor).
-pub fn run_dir(run_id: &str) -> String {
-    format!(".orx/runs/{run_id}")
+/// The remote run dir for a run, relative to `$HOME` when `remote_root` is
+/// home-relative, or absolute when `remote_root` is absolute.
+pub fn run_dir(remote_root: &str, run_id: &str) -> String {
+    let root = normalize_remote_root(remote_root);
+    format!("{root}/runs/{run_id}")
 }
 
-/// Submit the job: create the run dir, clone on the login node, write
-/// job.sbatch, `sbatch --parsable`. Returns the Slurm job id — the reattach
-/// handle (together with the host).
-pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
-    let dir = run_dir(&spec.run_id);
+/// Convenience: run dir from current settings (or the default remote root).
+pub fn run_dir_from_settings(run_id: &str) -> Result<String> {
+    let settings = load_settings()?.unwrap_or_default();
+    Ok(run_dir(&effective_remote_root(&settings), run_id))
+}
 
-    // Login-node setup (clone). Env + script travel via stdin so tokens never
-    // land on an argv or in a file.
-    let setup = format!(
-        "{exports}\ncd \"$HOME/{dir}\" || exit 97\n{script}\n",
-        exports = render_exports(&spec.env),
-        script = spec.setup_script,
-    );
-    ssh_run(
+/// Submit the job: require an agent-authored `job.sbatch` in the already-staged
+/// repo, then `sbatch --parsable` from the run directory. Returns the Slurm
+/// job id — the reattach handle (together with the host).
+pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
+    let dir = run_dir(&spec.remote_root, &spec.run_id);
+    let dir_shell = remote_path_shell(&dir);
+    let sbatch_rel = spec.sbatch_path.trim().trim_start_matches('/');
+    let sbatch_rel = if sbatch_rel.is_empty() {
+        "job.sbatch"
+    } else {
+        sbatch_rel
+    };
+    // Staged snapshot lands in repo/; the agent-authored script lives there.
+    let repo_sbatch = format!("repo/{sbatch_rel}");
+
+    let check = ssh_run(
         &SshTarget::alias(&spec.host),
-        &format!("mkdir -p \"$HOME/{dir}\" && chmod 700 \"$HOME/{dir}\" && bash -s"),
-        Some(&setup),
+        &format!(
+            "d={dir_shell}; \
+             if [ ! -d \"$d/repo\" ]; then echo MISSING_REPO; \
+             elif [ ! -f \"$d/{repo_sbatch}\" ]; then echo MISSING_SBATCH; \
+             else echo OK; fi"
+        ),
+        None,
     )
     .await
-    .map_err(|e| anyhow!("Setup on the login node failed: {e}"))?;
+    .map_err(|e| anyhow!("Could not check the staged run dir: {e}"))?;
 
-    // Write the batch script (owner-only: it embeds tokens) and submit.
-    ssh_run(
-        &SshTarget::alias(&spec.host),
-        &format!("umask 077 && cat > \"$HOME/{dir}/job.sbatch\""),
-        Some(&render_sbatch(spec)),
-    )
-    .await?;
+    match check.trim() {
+        "OK" => {}
+        "MISSING_REPO" => {
+            return Err(anyhow!(
+                "Staged snapshot missing at {dir}/repo — stage the source before submit."
+            ));
+        }
+        _ => {
+            return Err(anyhow!(
+                "No {sbatch_rel} in the staged experiment snapshot. \
+                 Add an agent-authored job.sbatch at the repo root (with \
+                 #SBATCH --output=log / --error=log and write exit_code in the \
+                 run directory), then relaunch."
+            ));
+        }
+    }
+
+    // Submit from the run dir so relative --output/--error/exit_code land there.
     let out = ssh_run(
         &SshTarget::alias(&spec.host),
-        &format!("cd \"$HOME/{dir}\" && sbatch --parsable job.sbatch"),
+        &format!("cd {dir_shell} && sbatch --parsable {repo_sbatch}"),
         None,
     )
     .await
@@ -263,9 +285,10 @@ pub struct JobState {
 /// down or the exit_code write is NFS-lagged — the supervisor debounces it
 /// over several polls before declaring the job lost.
 pub async fn inspect_job(host: &str, run_id: &str, job_id: &str) -> Result<JobState> {
-    let dir = run_dir(run_id);
+    let dir = run_dir_from_settings(run_id)?;
+    let dir_shell = remote_path_shell(&dir);
     let cmd = format!(
-        "d=\"$HOME/{dir}\"; \
+        "d={dir_shell}; \
          if [ -f \"$d/exit_code\" ]; then echo \"EXIT $(cat \"$d/exit_code\")\"; \
          else st=$(squeue -h -j {job_id} -o %T 2>/dev/null | head -n1); \
            if [ -n \"$st\" ]; then echo \"SQ $st\"; \
@@ -319,8 +342,9 @@ fn map_inspect_token(out: &str) -> JobState {
             state("RUNNING", None)
         }
         // Terminal per the scheduler but no exit_code file yet (NFS lag):
-        // job.sbatch exits with the payload's code, so sacct's verdict mirrors
-        // the payload — trust it. From squeue it's transient; keep polling.
+        // the agent's job.sbatch should exit with the payload's code, so
+        // sacct's verdict mirrors the payload — trust it. From squeue it's
+        // transient; keep polling.
         "COMPLETED" if source == "sacct" => state("COMPLETED", None),
         "COMPLETED" => state("RUNNING", None),
         // Also transient from squeue: default JobRequeue=1 (and
@@ -417,54 +441,49 @@ pub async fn preflight(host: &str) -> SlurmPreflight {
 mod tests {
     use super::*;
 
-    fn spec() -> SlurmJobSpec {
-        SlurmJobSpec {
-            host: "cluster".into(),
-            run_id: "0123456789abcdef".into(),
-            setup_script: "git clone x repo".into(),
-            command: "python train.py".into(),
-            env: HashMap::new(),
-            gres: None,
-            partition: None,
-            account: None,
-            time_limit_secs: None,
-        }
+    #[test]
+    fn normalize_remote_root_strips_tilde_and_home() {
+        assert_eq!(normalize_remote_root("~/scratch/.orx"), "scratch/.orx");
+        assert_eq!(normalize_remote_root("$HOME/scratch/.orx"), "scratch/.orx");
+        assert_eq!(normalize_remote_root("scratch/.orx/"), "scratch/.orx");
+        assert_eq!(normalize_remote_root("/mnt/scratch/.orx"), "/mnt/scratch/.orx");
+        assert_eq!(normalize_remote_root(DEFAULT_REMOTE_ROOT), "scratch/.orx");
     }
 
     #[test]
-    fn sbatch_minimal_has_only_fixed_directives() {
-        let script = render_sbatch(&spec());
-        assert!(script.starts_with("#!/usr/bin/env bash\n"));
-        assert!(script.contains("#SBATCH --job-name=orx-01234567\n"));
-        assert!(script.contains("#SBATCH --output=log\n"));
-        assert!(!script.contains("--partition"));
-        assert!(!script.contains("--account"));
-        assert!(!script.contains("--gres"));
-        assert!(!script.contains("--time"));
-        // Python is defaulted to unbuffered even with no author env, so Slurm's
-        // --output redirect streams the job's prints live.
-        assert!(script.contains("export PYTHONUNBUFFERED='1'\n"));
-        // Payload in a subshell; its code is recorded AND becomes the script's
-        // exit status (Slurm's COMPLETED/FAILED must mirror the payload).
-        assert!(script.ends_with(
-            "(\ncd repo || exit 97\npython train.py\n)\ncode=$?\necho \"$code\" > exit_code\nexit \"$code\"\n"
-        ));
+    fn run_dir_uses_remote_root() {
+        assert_eq!(
+            run_dir("~/scratch/.orx", "abc"),
+            "scratch/.orx/runs/abc"
+        );
+        assert_eq!(
+            run_dir("/mnt/scratch/.orx", "abc"),
+            "/mnt/scratch/.orx/runs/abc"
+        );
+        assert_eq!(run_dir(".orx", "abc"), ".orx/runs/abc");
     }
 
     #[test]
-    fn sbatch_emits_optional_directives_and_quoted_env() {
-        let mut s = spec();
-        s.gres = Some("gpu:h100:2".into());
-        s.partition = Some("gpu".into());
-        s.account = Some("lab-a".into());
-        s.time_limit_secs = Some(4 * 3600);
-        s.env.insert("TOKEN".into(), "it's; rm -rf /".into());
-        let script = render_sbatch(&s);
-        assert!(script.contains("#SBATCH --gres=gpu:h100:2\n"));
-        assert!(script.contains("#SBATCH --partition=gpu\n"));
-        assert!(script.contains("#SBATCH --account=lab-a\n"));
-        assert!(script.contains("#SBATCH --time=04:00:00\n"));
-        assert!(script.contains("export TOKEN='it'\\''s; rm -rf /'\n"));
+    fn remote_path_shell_quotes_home_or_absolute() {
+        assert_eq!(
+            remote_path_shell("scratch/.orx/runs/r1"),
+            "\"$HOME/scratch/.orx/runs/r1\""
+        );
+        assert_eq!(
+            remote_path_shell("/mnt/scratch/.orx/runs/r1"),
+            "\"/mnt/scratch/.orx/runs/r1\""
+        );
+    }
+
+    #[test]
+    fn effective_remote_root_defaults() {
+        let empty = SlurmSettings::default();
+        assert_eq!(effective_remote_root(&empty), DEFAULT_REMOTE_ROOT);
+        let set = SlurmSettings {
+            remote_root: Some("/data/.orx".into()),
+            ..Default::default()
+        };
+        assert_eq!(effective_remote_root(&set), "/data/.orx");
     }
 
     #[test]
@@ -481,85 +500,6 @@ mod tests {
         assert_eq!(resolve_gres("gpu:a100:4").as_deref(), Some("gpu:a100:4"));
         assert_eq!(resolve_gres("h100:2").as_deref(), Some("gpu:h100:2"));
         assert_eq!(resolve_gres("h100").as_deref(), Some("gpu:h100"));
-    }
-
-    /// Live E2E against a real cluster — opt-in, never runs in CI:
-    ///   ORX_SLURM_TEST_HOST=<ssh alias> cargo test jobs::slurm -- --ignored
-    /// Covers submit → SCHEDULING/RUNNING → COMPLETED with logs, plus
-    /// scancel → the job leaving the queue (CANCELED, or GONE where
-    /// accounting is disabled — the supervisor debounces GONE).
-    #[tokio::test]
-    #[ignore = "needs a live slurm cluster; set ORX_SLURM_TEST_HOST"]
-    async fn e2e_lifecycle_against_live_cluster() {
-        let Ok(host) = std::env::var("ORX_SLURM_TEST_HOST") else {
-            panic!("set ORX_SLURM_TEST_HOST to an ~/.ssh/config alias of a slurm login node");
-        };
-        let mk = |run_id: &str, command: &str| SlurmJobSpec {
-            host: host.clone(),
-            run_id: run_id.into(),
-            setup_script: "mkdir -p repo".into(),
-            command: command.into(),
-            env: HashMap::from([("ORX_E2E".into(), "1".into())]),
-            gres: None,
-            partition: None,
-            account: None,
-            time_limit_secs: Some(300),
-        };
-        // 150 × 2s: a busy cluster can hold a job PENDING for a few minutes.
-        let poll = |run_id: String, job_id: String, until: &'static [&'static str]| {
-            let host = host.clone();
-            async move {
-                for _ in 0..150 {
-                    let s = inspect_job(&host, &run_id, &job_id).await.unwrap();
-                    if until.contains(&s.stage.as_str()) {
-                        return s;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                panic!("job {job_id} never reached {until:?}");
-            }
-        };
-
-        // Fresh ids per invocation: a recycled run dir would satisfy
-        // inspect_job from its stale exit_code before the job even runs.
-        let run_a = format!("e2e-a-{}", uuid::Uuid::new_v4());
-        let run_b = format!("e2e-b-{}", uuid::Uuid::new_v4());
-        let cleanup = format!(
-            "rm -rf \"$HOME/{}\" \"$HOME/{}\"",
-            run_dir(&run_a),
-            run_dir(&run_b)
-        );
-
-        // Happy path: runs, completes, logs arrive.
-        let job_a = run_job(&mk(&run_a, "echo hello-from-slurm; echo \"env=$ORX_E2E\""))
-            .await
-            .unwrap();
-        let done = poll(run_a.clone(), job_a, &["COMPLETED", "ERROR"]).await;
-        assert_eq!(done.stage, "COMPLETED", "message: {:?}", done.message);
-        let mut lines = Vec::new();
-        crate::jobs::ssh::stream_logs(
-            &SshTarget::alias(&host),
-            &run_dir(&run_a),
-            0,
-            std::time::Duration::from_secs(5),
-            &mut |l: &str| lines.push(l.to_string()),
-        )
-        .await
-        .unwrap();
-        assert!(lines.iter().any(|l| l == "hello-from-slurm"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "env=1"), "{lines:?}");
-
-        // Cancel path: scancel'd job leaves the queue without an exit code.
-        let job_b = run_job(&mk(&run_b, "sleep 300")).await.unwrap();
-        poll(run_b.clone(), job_b.clone(), &["RUNNING", "SCHEDULING"]).await;
-        cancel_job(&host, &job_b).await.unwrap();
-        let after = poll(run_b, job_b, &["CANCELED", "GONE", "ERROR"]).await;
-        // Best-effort teardown before asserting — don't litter the cluster.
-        let _ = ssh_run(&SshTarget::alias(&host), &cleanup, None).await;
-        assert!(
-            after.stage == "CANCELED" || after.stage == "GONE",
-            "unexpected post-cancel stage: {after:?}"
-        );
     }
 
     #[test]
@@ -599,5 +539,91 @@ mod tests {
         assert_eq!(map_inspect_token("GONE").stage, "GONE");
         // Unknown states never wedge the supervisor into a terminal state.
         assert_eq!(map_inspect_token("SQ SOMETHING_NEW").stage, "RUNNING");
+    }
+
+    /// Live E2E against a real cluster — opt-in, never runs in CI:
+    ///   ORX_SLURM_TEST_HOST=<ssh alias> cargo test jobs::slurm -- --ignored
+    #[tokio::test]
+    #[ignore = "needs a live slurm cluster; set ORX_SLURM_TEST_HOST"]
+    async fn e2e_lifecycle_against_live_cluster() {
+        let Ok(host) = std::env::var("ORX_SLURM_TEST_HOST") else {
+            panic!("set ORX_SLURM_TEST_HOST to an ~/.ssh/config alias of a slurm login node");
+        };
+        let settings = load_settings().ok().flatten().unwrap_or_default();
+        let remote_root = effective_remote_root(&settings);
+        let mk = |run_id: &str| SlurmJobSpec {
+            host: host.clone(),
+            run_id: run_id.into(),
+            remote_root: remote_root.clone(),
+            sbatch_path: "job.sbatch".into(),
+        };
+        let poll = |run_id: String, job_id: String, until: &'static [&'static str]| {
+            let host = host.clone();
+            async move {
+                for _ in 0..150 {
+                    let s = inspect_job(&host, &run_id, &job_id).await.unwrap();
+                    if until.contains(&s.stage.as_str()) {
+                        return s;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("job {job_id} never reached {until:?}");
+            }
+        };
+
+        let run_a = format!("e2e-a-{}", uuid::Uuid::new_v4());
+        let run_b = format!("e2e-b-{}", uuid::Uuid::new_v4());
+        let dir_a = run_dir(&remote_root, &run_a);
+        let dir_b = run_dir(&remote_root, &run_b);
+        let dir_a_shell = remote_path_shell(&dir_a);
+        let dir_b_shell = remote_path_shell(&dir_b);
+        let cleanup = format!("rm -rf {dir_a_shell} {dir_b_shell}");
+
+        let sbatch_body = "#!/usr/bin/env bash\n#SBATCH --job-name=orx-e2e\n#SBATCH --output=log\n#SBATCH --error=log\n#SBATCH --open-mode=append\n(\ncd repo || exit 97\necho hello-from-slurm\n)\ncode=$?\necho \"$code\" > exit_code\nexit \"$code\"\n";
+        let stage = |run_id: &str, body: &str| {
+            let host = host.clone();
+            let remote_root = remote_root.clone();
+            let dir = run_dir(&remote_root, run_id);
+            let dir_shell = remote_path_shell(&dir);
+            let quoted = body.replace('\'', "'\\''");
+            let script = format!(
+                "umask 077; mkdir -p {dir_shell}/repo; \
+                 printf '%s' '{quoted}' > {dir_shell}/repo/job.sbatch; \
+                 chmod +x {dir_shell}/repo/job.sbatch"
+            );
+            async move {
+                ssh_run(&SshTarget::alias(&host), &script, None)
+                    .await
+                    .unwrap();
+            }
+        };
+
+        stage(&run_a, sbatch_body).await;
+        let job_a = run_job(&mk(&run_a)).await.unwrap();
+        let done = poll(run_a.clone(), job_a, &["COMPLETED", "ERROR"]).await;
+        assert_eq!(done.stage, "COMPLETED", "message: {:?}", done.message);
+        let mut lines = Vec::new();
+        crate::jobs::ssh::stream_logs(
+            &SshTarget::alias(&host),
+            &dir_a,
+            0,
+            std::time::Duration::from_secs(5),
+            &mut |l: &str| lines.push(l.to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(lines.iter().any(|l| l == "hello-from-slurm"), "{lines:?}");
+
+        let sleep_sbatch = "#!/usr/bin/env bash\n#SBATCH --job-name=orx-e2e-sleep\n#SBATCH --output=log\n#SBATCH --error=log\nsleep 300\necho 0 > exit_code\n";
+        stage(&run_b, sleep_sbatch).await;
+        let job_b = run_job(&mk(&run_b)).await.unwrap();
+        poll(run_b.clone(), job_b.clone(), &["RUNNING", "SCHEDULING"]).await;
+        cancel_job(&host, &job_b).await.unwrap();
+        let after = poll(run_b, job_b, &["CANCELED", "GONE", "ERROR"]).await;
+        let _ = ssh_run(&SshTarget::alias(&host), &cleanup, None).await;
+        assert!(
+            after.stage == "CANCELED" || after.stage == "GONE",
+            "unexpected post-cancel stage: {after:?}"
+        );
     }
 }

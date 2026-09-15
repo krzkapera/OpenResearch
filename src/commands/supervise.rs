@@ -1051,7 +1051,7 @@ async fn run_slurm(
     let (host, job_id) = descriptor.slurm_ref()?;
     let host = host.to_string();
     let job_id = job_id.to_string();
-    let dir = slurm::run_dir(&run_id);
+    let dir = slurm::run_dir_from_settings(&run_id)?;
 
     eprintln!("supervise {run_id}: watching slurm job {job_id} on {host}");
 

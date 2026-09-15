@@ -476,8 +476,8 @@ pub struct ExpRunArgs {
     /// Hardware flavor. With `--backend hf`: t4-small, a10g-small, a100-large,
     /// h200, … With `--backend modal`: a Modal GPU (t4, l4, a10g, a100,
     /// a100-80gb, l40s, h100, h200, or e.g. h100:2) or cpu/cpu-large. With
-    /// `--backend slurm`: a GPU request as a GRES spec (h100:2 → --gres=gpu:h100:2;
-    /// plain `gpu` → one GPU; omit for CPU-only). With `--backend ray`: optional
+    /// `--backend slurm`: optional; not applied at submit (put `#SBATCH --gres=`
+    /// in agent-authored `job.sbatch`). With `--backend ray`: optional
     /// entrypoint resources (`cpu:2`, `gpu:1`, `gpu:1,mem:8GiB`; omit to reserve
     /// nothing). With `--backend openresearch`: a GPU id from `orx compute`
     /// (h100_sxm, or h100_sxm:2 for two) or a CPU flavor (cpu5c/cpu5g/cpu5m, or
@@ -508,9 +508,8 @@ pub struct ExpRunArgs {
     /// Job timeout (with `--backend hf/modal/k8s/slurm/openresearch`): 90s,
     /// 30m, 4h, 1d. Default 4h (HF's own default is only 30 minutes). With
     /// `--backend k8s` it becomes activeDeadlineSeconds unless the manifest
-    /// sets its own. With `--backend slurm` it becomes `#SBATCH --time=` and
-    /// has no 4h default — unset falls back to the slurm settings, then the
-    /// cluster's own limit. With `--backend openresearch` it bounds the run's
+    /// With `--backend slurm` it is not applied at submit (put `#SBATCH --time=`
+    /// in agent-authored `job.sbatch`). With `--backend openresearch` it bounds the run's
     /// wall clock on the box (the box itself is deleted when the run ends).
     /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]

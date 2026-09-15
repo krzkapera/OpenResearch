@@ -6057,6 +6057,9 @@ fn slurm_settings_json() -> Value {
         "partition": settings.partition,
         "account": settings.account,
         "timeLimit": settings.time_limit,
+        "remoteRoot": settings.remote_root.clone().unwrap_or_else(|| {
+            crate::jobs::slurm::DEFAULT_REMOTE_ROOT.to_string()
+        }),
         "hosts": list_ssh_hosts(),
     })
 }
@@ -6075,6 +6078,9 @@ struct SetSlurmSettingsReq {
     partition: Option<String>,
     account: Option<String>,
     time_limit: Option<String>,
+    /// Remote base for runs/source (default `~/scratch/.orx`). `Some("")` resets
+    /// to the built-in default.
+    remote_root: Option<String>,
 }
 
 async fn set_slurm_settings(Json(req): Json<SetSlurmSettingsReq>) -> ApiResult {
@@ -6099,6 +6105,9 @@ async fn set_slurm_settings(Json(req): Json<SetSlurmSettingsReq>) -> ApiResult {
                 crate::jobs::huggingface::parse_timeout(t).map_err(bad_request)?;
             }
             settings.time_limit = t;
+        }
+        if let Some(r) = req.remote_root {
+            settings.remote_root = norm(r);
         }
         slurm::save_settings(&settings)?;
         Ok(Json(slurm_settings_json()))
