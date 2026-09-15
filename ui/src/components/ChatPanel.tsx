@@ -96,6 +96,7 @@ import {
   sendChatMessage,
   setChatSessionArchived,
   setChatSessionPermissionMode,
+  setChatSessionAutoResume,
   setChatSessionPlanMode,
   type FirstActionSurface,
   type ChatImageAttachment,
@@ -4288,6 +4289,7 @@ export function ChatPanel({
   children?: React.ReactNode;
 }) {
   const setChatSessionPermissionModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPermissionMode>) => setChatSessionPermissionMode(...args) });
+  const setChatSessionAutoResumeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionAutoResume>) => setChatSessionAutoResume(...args) });
   const setChatSessionPlanModeMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionPlanMode>) => setChatSessionPlanMode(...args) });
   const createChatSessionMutation = useMutation({ mutationFn: (args: Parameters<typeof createChatSession>) => createChatSession(...args) });
   const setChatSessionArchivedMutation = useMutation({ mutationFn: (args: Parameters<typeof setChatSessionArchived>) => setChatSessionArchived(...args) });
@@ -4627,6 +4629,15 @@ export function ChatPanel({
     );
     return result;
   }, [sessionsOptions]);
+  const autoResumeSupported = !!activeHarness?.supportsFiveHourQuotaProbe;
+  const setAutoResume = (enabled: boolean) => {
+    const sessionId = openSession?.id;
+    if (!sessionId || !autoResumeSupported) return;
+    void queueSessionMutation(() => setChatSessionAutoResumeMutation.mutateAsync([sessionId, enabled]))
+      .then((session) => { if (session) applySession(session); })
+      .catch(() => undefined);
+  };
+
   const setPermissionMode = (id: string) => {
     // Plan is session-scoped. Claude exposes it in the permission dropdown,
     // but it must not become the saved default for future sessions.
@@ -6466,6 +6477,20 @@ export function ChatPanel({
               {/* The model picker reflects the open session (harness locked once it
                 exists); the global default only applies before the first
                 message. */}
+              {openSession && (
+                <label
+                  className={`composer-auto-resume me-2 flex items-center gap-1.5 text-xs text-muted ${!autoResumeSupported ? "opacity-50" : ""}`}
+                  title={autoResumeSupported ? m.chat_panel_auto_resume_hint() : m.chat_panel_auto_resume_unavailable()}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!!openSession.autoResume}
+                    disabled={!autoResumeSupported}
+                    onChange={(e) => setAutoResume(e.target.checked)}
+                  />
+                  <span>{m.chat_panel_auto_resume()}</span>
+                </label>
+              )}
               <div className="flex min-w-0 items-center">
                 <ModelPicker
                   value={composerSelection}

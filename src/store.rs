@@ -619,6 +619,7 @@ impl Store {
             "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
@@ -628,6 +629,25 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
+
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS chat_auto_resume_pending (
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                recovery_action TEXT NOT NULL,
+                reset_at_ms INTEGER,
+                state TEXT NOT NULL DEFAULT 'pending',
+                claim_token TEXT,
+                claimed_at INTEGER,
+                finished_at INTEGER,
+                finish_reason TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, turn_id)
+             )",
+            [],
+        );
+
         // Legacy tool failures cannot identify the missing dependency, so require one fresh check.
         conn.execute(
             "DELETE FROM ssh_host_tests
@@ -1963,6 +1983,113 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_chat_session_auto_resume(&self, id: &str, auto_resume: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET auto_resume = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, auto_resume as i64, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_chat_auto_resume_pending(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        recovery_action: &str,
+        reset_at_ms: Option<i64>,
+    ) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO chat_auto_resume_pending
+                (session_id, turn_id, recovery_action, reset_at_ms, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)
+             ON CONFLICT(session_id, turn_id) DO UPDATE SET
+                recovery_action = excluded.recovery_action,
+                reset_at_ms = excluded.reset_at_ms,
+                state = 'pending',
+                claim_token = NULL,
+                claimed_at = NULL,
+                finished_at = NULL,
+                finish_reason = NULL,
+                updated_at = excluded.updated_at",
+            params![session_id, turn_id, recovery_action, reset_at_ms, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_due_chat_auto_resume_pending(
+        &self,
+        now_ms_val: i64,
+    ) -> Result<Vec<ChatAutoResumePending>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, turn_id, recovery_action, reset_at_ms, state
+             FROM chat_auto_resume_pending
+             WHERE state = 'pending'
+               AND (reset_at_ms IS NULL OR reset_at_ms <= ?1)
+             ORDER BY COALESCE(reset_at_ms, 0) ASC, created_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![now_ms_val], |row| {
+                Ok(ChatAutoResumePending {
+                    session_id: row.get(0)?,
+                    turn_id: row.get(1)?,
+                    recovery_action: row.get(2)?,
+                    reset_at_ms: row.get(3)?,
+                    state: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn claim_chat_auto_resume_pending(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        now_ms_val: i64,
+    ) -> Result<bool> {
+        let token = uuid::Uuid::new_v4().to_string();
+        let changed = self.conn.execute(
+            "UPDATE chat_auto_resume_pending
+             SET state = 'claimed', claim_token = ?3, claimed_at = ?4, updated_at = ?4
+             WHERE session_id = ?1 AND turn_id = ?2 AND state = 'pending'",
+            params![session_id, turn_id, token, now_ms_val],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn release_chat_auto_resume_pending(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        reset_at_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_auto_resume_pending
+             SET state = 'pending', claim_token = NULL, claimed_at = NULL,
+                 reset_at_ms = ?3, updated_at = ?4
+             WHERE session_id = ?1 AND turn_id = ?2 AND state = 'claimed'",
+            params![session_id, turn_id, reset_at_ms, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_chat_auto_resume_pending(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_auto_resume_pending
+             SET state = 'done', finish_reason = ?3, finished_at = ?4, updated_at = ?4,
+                 claim_token = NULL
+             WHERE session_id = ?1 AND turn_id = ?2",
+            params![session_id, turn_id, reason, now_ms()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_chat_session_permission_mode(&self, id: &str, mode: &str) -> Result<()> {
         self.set_chat_session_permission_mode_value(id, Some(mode))
     }
@@ -2811,6 +2938,15 @@ pub struct SshHostTest {
     pub tested_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatAutoResumePending {
+    pub session_id: String,
+    pub turn_id: String,
+    pub recovery_action: String,
+    pub reset_at_ms: Option<i64>,
+    pub state: String,
+}
+
 /// One chat thread with a harness. `native_session_id` is the harness's own
 /// session/rollout id (set after the first turn for CLIs that mint it lazily).
 #[derive(Debug, Clone)]
@@ -2852,6 +2988,8 @@ pub struct StoredChatSession {
     /// Session that spawned this one with `orx agent spawn`. `None` for
     /// sessions the user started from the dashboard.
     pub parent_session_id: Option<String>,
+    /// When true, exhausted 5h quota failures wait for reset then recover.
+    pub auto_resume: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -2999,7 +3137,7 @@ fn row_to_chat_turn(
 
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
-     created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id";
+     created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id, auto_resume";
 
 fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, rusqlite::Error> {
     Ok(ChatSpawn {
@@ -3035,6 +3173,7 @@ fn row_to_chat_session(
         bootstrap_context: row.get(16)?,
         active_leaf_id: row.get(17)?,
         parent_session_id: row.get(18)?,
+        auto_resume: row.get::<_, i64>(19).map(|v| v != 0).unwrap_or(false),
     })
 }
 
@@ -4051,6 +4190,7 @@ mod tests {
             bootstrap_context: None,
             active_leaf_id: None,
             parent_session_id: None,
+            auto_resume: false,
             created_at: 1,
             updated_at: 1,
         }

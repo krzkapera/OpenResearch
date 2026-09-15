@@ -497,6 +497,14 @@ impl Harness for Codex {
         true
     }
 
+    fn supports_five_hour_quota_probe(&self) -> bool {
+        true
+    }
+
+    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
+        probe_codex_five_hour_quota().await
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         if let Some(bin) = find_codex() {
@@ -3702,6 +3710,91 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
         }
         _ => {}
     }
+}
+
+async fn probe_codex_five_hour_quota() -> crate::local::harness::QuotaProbeResult {
+    use crate::local::harness::quota::{parse_codex_rate_limits_json, QuotaProbeResult};
+    // Try installed helper first (same JSON shape as scripts/quota/codex-limits.sh).
+    for program in ["codex-limits"] {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.arg("--json")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Ok(Ok(output)) =
+            tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output()).await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    return parse_codex_rate_limits_json(&stdout);
+                }
+            }
+        }
+    }
+    match run_codex_rate_limits_via_app_server().await {
+        Ok(json) => parse_codex_rate_limits_json(&json),
+        Err(detail) => QuotaProbeResult::Unknown { detail },
+    }
+}
+
+async fn run_codex_rate_limits_via_app_server() -> Result<String, String> {
+    let script = concat!(
+        "import json,select,subprocess,sys,time\n",
+        "proc=subprocess.Popen(['codex','app-server','--stdio'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)\n",
+        "def send(o):\n",
+        " proc.stdin.write(json.dumps(o)+'\\n'); proc.stdin.flush()\n",
+        "def read_until(pred,timeout=30.0):\n",
+        " deadline=time.time()+timeout\n",
+        " while time.time()<deadline:\n",
+        "  if proc.poll() is not None:\n",
+        "   err=proc.stderr.read() if proc.stderr else ''\n",
+        "   raise RuntimeError(f'app-server exited {proc.returncode}: {err.strip()}')\n",
+        "  r,_,_=select.select([proc.stdout],[],[],0.5)\n",
+        "  if not r: continue\n",
+        "  line=proc.stdout.readline()\n",
+        "  if not line: continue\n",
+        "  line=line.strip()\n",
+        "  if not line: continue\n",
+        "  try: msg=json.loads(line)\n",
+        "  except json.JSONDecodeError: continue\n",
+        "  if pred(msg): return msg\n",
+        " raise TimeoutError('timed out waiting for app-server response')\n",
+        "try:\n",
+        " send({'method':'initialize','id':0,'params':{'clientInfo':{'name':'orx_quota_probe','title':'orx','version':'0.1.0'}}})\n",
+        " read_until(lambda m: m.get('id')==0)\n",
+        " send({'method':'initialized','params':{}})\n",
+        " send({'method':'account/rateLimits/read','id':1,'params':{}})\n",
+        " resp=read_until(lambda m: m.get('id')==1)\n",
+        "finally:\n",
+        " try: proc.stdin.close()\n",
+        " except Exception: pass\n",
+        " proc.terminate()\n",
+        " try: proc.wait(timeout=3)\n",
+        " except subprocess.TimeoutExpired: proc.kill()\n",
+        "if 'error' in resp:\n",
+        " print(json.dumps(resp['error']), file=sys.stderr); sys.exit(2)\n",
+        "print(json.dumps(resp.get('result') or {}))\n",
+    );
+    let mut cmd = tokio::process::Command::new("python3");
+    cmd.arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output())
+        .await
+        .map_err(|_| "codex app-server probe timed out".to_string())?
+        .map_err(|err| format!("codex app-server probe spawn failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "codex app-server probe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(test)]

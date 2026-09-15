@@ -464,6 +464,14 @@ impl Harness for ClaudeCode {
         true
     }
 
+    fn supports_five_hour_quota_probe(&self) -> bool {
+        true
+    }
+
+    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
+        probe_claude_five_hour_quota().await
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         if let Some(bin) = find_claude() {
@@ -2152,6 +2160,43 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     }
     let _ = ctx.flush();
     Ok(())
+}
+
+async fn probe_claude_five_hour_quota() -> crate::local::harness::QuotaProbeResult {
+    use crate::local::harness::quota::{parse_claude_usage_text, QuotaProbeResult};
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(["-p", "/usage", "--output-format", "json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output()).await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            return QuotaProbeResult::Unknown {
+                detail: format!("claude spawn failed: {err}"),
+            };
+        }
+        Err(_) => {
+            return QuotaProbeResult::Unknown {
+                detail: "claude /usage timed out".into(),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr.as_ref()
+    } else {
+        stdout.as_ref()
+    };
+    if text.trim().is_empty() {
+        return QuotaProbeResult::Unknown {
+            detail: "claude /usage returned empty output".into(),
+        };
+    }
+    parse_claude_usage_text(text)
 }
 
 #[cfg(test)]

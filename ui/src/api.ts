@@ -1633,6 +1633,8 @@ export interface Harness {
   /** A running turn takes further input, so the composer steers instead of
    * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
+  /** Capability: harness can probe the rolling ~5h usage window. */
+  supportsFiveHourQuotaProbe: boolean;
   models: HarnessModel[];
   options: HarnessOptions;
 }
@@ -1835,6 +1837,8 @@ export interface ChatSession {
   /** Session whose agent spawned this one with `orx agent spawn`; null for
    * sessions the user started themselves. */
   parentSessionId?: string | null;
+  /** Wait outside the model for 5h quota reset, then continue/retry. Default off. */
+  autoResume: boolean;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
@@ -1890,6 +1894,11 @@ export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
 
 export const setChatSessionPermissionMode = (sessionId: string, permissionMode: string) =>
   patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { permissionMode }).then(
+    (r) => r.session,
+  );
+
+export const setChatSessionAutoResume = (sessionId: string, autoResume: boolean) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { autoResume }).then(
     (r) => r.session,
   );
 

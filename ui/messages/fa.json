@@ -1144,5 +1144,8 @@
   "skills_remove_imported_label": "حذف {name} از OpenResearch",
   "skills_remove_imported_confirm": "«{name}» از OpenResearch حذف شود؟ فایل‌های اصلی در عامل برنامه‌نویسی شما باقی می‌مانند.",
   "chat_session_limit_reached": "به سقف مصرف نشست رسیده‌اید",
-  "chat_model_unavailable": "مدل در دسترس نیست"
+  "chat_model_unavailable": "مدل در دسترس نیست",
+  "chat_panel_auto_resume": "Auto-resume",
+  "chat_panel_auto_resume_hint": "When the 5-hour usage quota is exhausted, wait for it to reset and continue automatically.",
+  "chat_panel_auto_resume_unavailable": "Auto-resume needs a harness that can probe the 5-hour usage quota."
 }

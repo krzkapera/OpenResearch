@@ -144,6 +144,8 @@ pub struct HarnessInfo {
     /// Whether a running turn accepts further user input, which is what lets
     /// the composer steer instead of parking the message until the turn ends.
     pub supports_steering: bool,
+    /// Whether this harness can probe the rolling ~5h usage quota for auto-resume.
+    pub supports_five_hour_quota_probe: bool,
     pub models: Vec<ModelInfo>,
     /// Composer toggle vocabulary (permission modes, reasoning levels).
     pub options: super::HarnessOptions,
@@ -167,6 +169,7 @@ impl HarnessInfo {
             agent_ready: false,
             agent_note: None,
             supports_steering: false,
+            supports_five_hour_quota_probe: false,
             models: Vec::new(),
             options: super::HarnessOptions::none(),
         }

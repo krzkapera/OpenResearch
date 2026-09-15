@@ -152,6 +152,7 @@ fn spawn(
         bootstrap_context: None,
         active_leaf_id: None,
         parent_session_id: Some(parent_id.clone()),
+        auto_resume: false,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -202,6 +203,7 @@ mod tests {
             bootstrap_context: None,
             active_leaf_id: None,
             parent_session_id: parent_session_id.map(str::to_string),
+            auto_resume: false,
             created_at: 1,
             updated_at: 1,
         }

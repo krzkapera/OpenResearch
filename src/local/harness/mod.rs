@@ -24,6 +24,7 @@ mod detect;
 pub(crate) mod opencode;
 mod options;
 mod plan_gate;
+pub(crate) mod quota;
 pub(crate) mod title;
 
 use std::hash::{Hash, Hasher};
@@ -44,6 +45,7 @@ pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;
 pub use plan_gate::decide as plan_gate_decide;
+pub use quota::QuotaProbeResult;
 
 /// A turn with NO events for this long is treated as wedged and interrupted
 /// rather than held busy forever. Known false positive: a command that is
@@ -284,6 +286,19 @@ pub trait Harness: Send + Sync {
         false
     }
 
+    /// Whether this harness can probe the rolling ~5h usage window used by
+    /// auto-resume. Default unsupported — Cursor/OpenCode stay here until a
+    /// real probe exists. Capability-based: never gate on harness name.
+    fn supports_five_hour_quota_probe(&self) -> bool {
+        false
+    }
+
+    /// Probe the rolling ~5h usage window. Default: [`QuotaProbeResult::Unsupported`].
+    async fn probe_five_hour_quota(&self) -> QuotaProbeResult {
+        let _ = self;
+        QuotaProbeResult::Unsupported
+    }
+
     /// The permission-mode / reasoning-level vocabulary this harness supports,
     /// for the composer toggles. Default is neither control (the UI hides both).
     fn options(&self) -> HarnessOptions {
@@ -464,6 +479,10 @@ pub fn supports_steering(harness_id: &str) -> bool {
     chat_harness(harness_id).is_some_and(|harness| harness.supports_steering())
 }
 
+pub fn supports_five_hour_quota_probe(harness_id: &str) -> bool {
+    chat_harness(harness_id).is_some_and(|harness| harness.supports_five_hour_quota_probe())
+}
+
 pub fn supports_command_plan(harness_id: &str) -> bool {
     chat_harness(harness_id).and_then(|harness| harness.options().plan_activation)
         == Some(options::PlanActivation::Command)
@@ -542,6 +561,7 @@ async fn detect_one(harness: &dyn Harness) -> Option<HarnessInfo> {
         // whose run path can't steer. A steering harness whose `detect` forgets
         // to set it reports false and silently queues every send.
         info.supports_steering &= harness.supports_steering();
+        info.supports_five_hour_quota_probe = harness.supports_five_hour_quota_probe();
         info
     })
 }

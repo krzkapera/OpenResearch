@@ -428,7 +428,6 @@ pub(crate) fn remote_fs_path(dir: &str) -> String {
     }
 }
 
-
 /// Single-quote a value for safe embedding in the remote bash script.
 pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -541,11 +540,7 @@ pub async fn stream_logs(
     sink: &mut (dyn FnMut(&str) + Send),
 ) -> Result<u64> {
     let cmd = if dir.starts_with('/') {
-        format!(
-            "tail -n +{} \"{}/log\" 2>/dev/null || true",
-            skip + 1,
-            dir
-        )
+        format!("tail -n +{} \"{}/log\" 2>/dev/null || true", skip + 1, dir)
     } else {
         format!(
             "tail -n +{} \"$HOME/{}/log\" 2>/dev/null || true",

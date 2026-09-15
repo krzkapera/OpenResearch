@@ -1120,6 +1120,7 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "contextUsage": context_usage,
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
+        "autoResume": s.auto_resume,
     })
 }
 
@@ -5192,6 +5193,15 @@ impl ChatHost {
                     .unwrap_or(false);
                 if changed {
                     ctx.push_turn_failure(&kind, message.clone(), action);
+                    maybe_queue_auto_resume_after_failure(
+                        &ctx.session_id,
+                        &ctx.turn_id,
+                        &ctx.harness,
+                        action,
+                        &kind,
+                        &message,
+                    )
+                    .await;
                 }
                 if changed && ctx.retry_exhausted {
                     crate::telemetry::capture(
@@ -5766,6 +5776,19 @@ impl ChatHost {
             }
         }
         self.emit_queued(session_id);
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_auto_resume(
+        &self,
+        session_id: &str,
+        auto_resume: bool,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        if store.get_chat_session(session_id)?.is_none() {
+            return Ok(None);
+        }
+        store.set_chat_session_auto_resume(session_id, auto_resume)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -7641,6 +7664,191 @@ async fn deliver_wake_up(
 
 /// Resume explicitly subscribed agent sessions after a run finishes. Busy and
 /// draining sessions retain their durable wake-up until they become idle.
+/// Background watcher: when a session failed on five-hour quota exhaustion and
+/// Auto-resume is ON, wait until reset_at (outside the model), re-probe, then
+/// recover once via the stored recovery_action (continue vs retry).
+pub async fn watch_auto_resume(
+    chat: Arc<ChatHost>,
+    data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        let _data_dir_guard = data_dir_gate.lock().await;
+        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
+            continue;
+        }
+        if let Err(err) = process_auto_resume_pending(&chat).await {
+            eprintln!("orx up: auto-resume watcher: {err}");
+        }
+    }
+}
+
+async fn process_auto_resume_pending(chat: &Arc<ChatHost>) -> Result<()> {
+    let now = now_ms();
+    let pending = {
+        let store = Store::open()?;
+        store.list_due_chat_auto_resume_pending(now)?
+    };
+    for row in pending {
+        let claimed = {
+            let store = Store::open()?;
+            store.claim_chat_auto_resume_pending(&row.session_id, &row.turn_id, now)?
+        };
+        if !claimed {
+            continue;
+        }
+        if chat.is_busy(&row.session_id).await {
+            let store = Store::open()?;
+            let _ = store.release_chat_auto_resume_pending(
+                &row.session_id,
+                &row.turn_id,
+                row.reset_at_ms.unwrap_or(now + 30_000),
+            );
+            continue;
+        }
+        let session = {
+            let store = Store::open()?;
+            store.get_chat_session(&row.session_id)?
+        };
+        let Some(session) = session else {
+            let store = Store::open()?;
+            let _ = store.finish_chat_auto_resume_pending(
+                &row.session_id,
+                &row.turn_id,
+                "missing_session",
+            );
+            continue;
+        };
+        if !session.auto_resume {
+            let store = Store::open()?;
+            let _ = store.finish_chat_auto_resume_pending(
+                &row.session_id,
+                &row.turn_id,
+                "auto_resume_off",
+            );
+            continue;
+        }
+        let Some(harness) = crate::local::harness::chat_harness(&session.harness) else {
+            let store = Store::open()?;
+            let _ =
+                store.finish_chat_auto_resume_pending(&row.session_id, &row.turn_id, "no_harness");
+            continue;
+        };
+        if !harness.supports_five_hour_quota_probe() {
+            let store = Store::open()?;
+            let _ =
+                store.finish_chat_auto_resume_pending(&row.session_id, &row.turn_id, "unsupported");
+            continue;
+        }
+        let probe = harness.probe_five_hour_quota().await;
+        match probe {
+            crate::local::harness::QuotaProbeResult::Available { .. } => {
+                let action = row.recovery_action.clone();
+                let empty = RecoveryOverrides {
+                    model: None,
+                    service_tier: None,
+                    permission_mode: None,
+                    plan_mode: None,
+                    reasoning_level: None,
+                };
+                match chat
+                    .recover_turn(&row.session_id, &row.turn_id, &action, empty)
+                    .await
+                {
+                    Ok(_) => {
+                        let store = Store::open()?;
+                        let _ = store.finish_chat_auto_resume_pending(
+                            &row.session_id,
+                            &row.turn_id,
+                            "recovered",
+                        );
+                        crate::telemetry::capture(
+                            "chat_auto_resume_recovered",
+                            json!({ "harness": session.harness, "action": action }),
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "orx up: auto-resume recover failed for {}: {err}",
+                            row.session_id
+                        );
+                        let store = Store::open()?;
+                        let _ = store.release_chat_auto_resume_pending(
+                            &row.session_id,
+                            &row.turn_id,
+                            now + 60_000,
+                        );
+                    }
+                }
+            }
+            crate::local::harness::QuotaProbeResult::Exhausted { reset_at_ms } => {
+                let wake = reset_at_ms.unwrap_or(now + 60_000).max(now + 15_000);
+                let store = Store::open()?;
+                let _ = store.release_chat_auto_resume_pending(&row.session_id, &row.turn_id, wake);
+            }
+            other => {
+                let store = Store::open()?;
+                let _ = store.release_chat_auto_resume_pending(
+                    &row.session_id,
+                    &row.turn_id,
+                    now + 60_000,
+                );
+                eprintln!(
+                    "orx up: auto-resume probe inconclusive for {}: {other:?}",
+                    row.session_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn maybe_queue_auto_resume_after_failure(
+    session_id: &str,
+    turn_id: &str,
+    harness_id: &str,
+    recovery_action: &str,
+    _error_kind: &str,
+    _error_message: &str,
+) {
+    let auto_resume = {
+        let Ok(store) = Store::open() else { return };
+        let Ok(Some(session)) = store.get_chat_session(session_id) else {
+            return;
+        };
+        session.auto_resume
+    };
+    if !auto_resume {
+        return;
+    }
+    let Some(harness) = crate::local::harness::chat_harness(harness_id) else {
+        return;
+    };
+    if !harness.supports_five_hour_quota_probe() {
+        return;
+    }
+    let probe = harness.probe_five_hour_quota().await;
+    let crate::local::harness::QuotaProbeResult::Exhausted { reset_at_ms } = probe else {
+        return;
+    };
+    let reset_at = reset_at_ms.unwrap_or_else(|| now_ms() + 60_000);
+    let Ok(store) = Store::open() else { return };
+    if let Err(err) =
+        store.upsert_chat_auto_resume_pending(session_id, turn_id, recovery_action, Some(reset_at))
+    {
+        eprintln!("orx up: could not queue auto-resume: {err}");
+        return;
+    }
+    crate::telemetry::capture(
+        "chat_auto_resume_queued",
+        json!({ "harness": harness_id, "resetAt": reset_at, "action": recovery_action }),
+    );
+}
+
 pub async fn watch_runs(
     chat: Arc<ChatHost>,
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
@@ -8928,6 +9136,7 @@ mod bridge_tests {
             bootstrap_context: None,
             active_leaf_id: None,
             parent_session_id: None,
+            auto_resume: false,
             created_at: 1,
             updated_at: 1,
         }
@@ -9067,6 +9276,7 @@ mod run_wakeup_tests {
                 bootstrap_context: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                auto_resume: false,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -9830,6 +10040,7 @@ mod steering_tests {
                 bootstrap_context: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                auto_resume: false,
                 created_at: 1,
                 updated_at: 1,
             })

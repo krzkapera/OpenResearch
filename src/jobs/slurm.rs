@@ -446,16 +446,16 @@ mod tests {
         assert_eq!(normalize_remote_root("~/scratch/.orx"), "scratch/.orx");
         assert_eq!(normalize_remote_root("$HOME/scratch/.orx"), "scratch/.orx");
         assert_eq!(normalize_remote_root("scratch/.orx/"), "scratch/.orx");
-        assert_eq!(normalize_remote_root("/mnt/scratch/.orx"), "/mnt/scratch/.orx");
+        assert_eq!(
+            normalize_remote_root("/mnt/scratch/.orx"),
+            "/mnt/scratch/.orx"
+        );
         assert_eq!(normalize_remote_root(DEFAULT_REMOTE_ROOT), "scratch/.orx");
     }
 
     #[test]
     fn run_dir_uses_remote_root() {
-        assert_eq!(
-            run_dir("~/scratch/.orx", "abc"),
-            "scratch/.orx/runs/abc"
-        );
+        assert_eq!(run_dir("~/scratch/.orx", "abc"), "scratch/.orx/runs/abc");
         assert_eq!(
             run_dir("/mnt/scratch/.orx", "abc"),
             "/mnt/scratch/.orx/runs/abc"

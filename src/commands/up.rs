@@ -153,6 +153,11 @@ pub async fn run(args: UpArgs) -> Result<()> {
         state.data_dir_move_in_progress.clone(),
         state.data_dir_gate.clone(),
     ));
+    tokio::spawn(local::chat::watch_auto_resume(
+        state.chat.clone(),
+        state.data_dir_move_in_progress.clone(),
+        state.data_dir_gate.clone(),
+    ));
     spawn_claude_auth_monitor(state.chat.clone(), claude.clone(), state.harnesses.clone());
     spawn_background_tasks(remote_auth.is_none());
     let live_events = state.chat.clone();
@@ -6863,6 +6868,7 @@ async fn create_chat_session(
         bootstrap_context: None,
         active_leaf_id: None,
         parent_session_id: None,
+        auto_resume: false,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -6885,6 +6891,7 @@ struct UpdateChatSessionReq {
     title: Option<String>,
     plan_mode: Option<bool>,
     permission_mode: Option<String>,
+    auto_resume: Option<bool>,
 }
 
 async fn update_chat_session(
@@ -6919,6 +6926,12 @@ async fn update_chat_session(
         state
             .chat
             .set_permission_mode(&id, &permission_mode)
+            .await?
+            .ok_or_else(|| not_found("chat session"))?
+    } else if let Some(auto_resume) = req.auto_resume {
+        state
+            .chat
+            .set_auto_resume(&id, auto_resume)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else {
