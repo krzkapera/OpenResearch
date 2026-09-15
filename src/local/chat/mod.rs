@@ -5193,15 +5193,24 @@ impl ChatHost {
                     .unwrap_or(false);
                 if changed {
                     ctx.push_turn_failure(&kind, message.clone(), action);
-                    maybe_queue_auto_resume_after_failure(
-                        &ctx.session_id,
-                        &ctx.turn_id,
-                        &ctx.harness,
-                        action,
-                        &kind,
-                        &message,
-                    )
-                    .await;
+                    // Do not block turn settlement on a quota probe (can take seconds).
+                    let session_id = ctx.session_id.clone();
+                    let turn_id = ctx.turn_id.clone();
+                    let harness = ctx.harness.clone();
+                    let action = action.to_string();
+                    let kind = kind.clone();
+                    let message = message.clone();
+                    tokio::spawn(async move {
+                        maybe_queue_auto_resume_after_failure(
+                            &session_id,
+                            &turn_id,
+                            &harness,
+                            &action,
+                            &kind,
+                            &message,
+                        )
+                        .await;
+                    });
                 }
                 if changed && ctx.retry_exhausted {
                     crate::telemetry::capture(
@@ -7812,8 +7821,8 @@ async fn maybe_queue_auto_resume_after_failure(
     turn_id: &str,
     harness_id: &str,
     recovery_action: &str,
-    _error_kind: &str,
-    _error_message: &str,
+    error_kind: &str,
+    error_message: &str,
 ) {
     let auto_resume = {
         let Ok(store) = Store::open() else { return };
@@ -7829,6 +7838,10 @@ async fn maybe_queue_auto_resume_after_failure(
         return;
     };
     if !harness.supports_five_hour_quota_probe() {
+        return;
+    }
+    if !crate::local::harness::quota::looks_like_five_hour_quota_failure(error_kind, error_message)
+    {
         return;
     }
     let probe = harness.probe_five_hour_quota().await;
