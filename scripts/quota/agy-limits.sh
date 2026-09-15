@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Print Antigravity (agy) five-hour / weekly usage via `agy -p /usage`.
-# Ops helper — no agy harness on this branch; kept for operators.
+# Ops helper — mirrors Antigravity harness five-hour probe parsing.
 # Usage:
 #   agy-limits
 #   agy-limits --json

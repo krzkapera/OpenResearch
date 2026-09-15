@@ -59,6 +59,14 @@ impl Harness for Antigravity {
         true
     }
 
+    fn supports_five_hour_quota_probe(&self) -> bool {
+        true
+    }
+
+    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
+        probe_agy_five_hour_quota().await
+    }
+
     async fn detect(&self) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         if let Some(bin) = find_agy() {
@@ -650,6 +658,62 @@ fn plan_card(parts: &[WirePart], assistant_id: &str, errored: bool) -> Option<Wi
             ..Default::default()
         },
     ))
+}
+
+async fn probe_agy_five_hour_quota() -> crate::local::harness::QuotaProbeResult {
+    use crate::local::harness::quota::{parse_agy_usage_text, QuotaProbeResult};
+
+    async fn run_agy_usage(extra_json: bool) -> Result<String, String> {
+        let mut cmd = tokio::process::Command::new("agy");
+        if extra_json {
+            cmd.args(["-p", "/usage", "--output-format", "json"]);
+        } else {
+            cmd.args(["-p", "/usage"]);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let output =
+            match tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(err)) => return Err(format!("agy spawn failed: {err}")),
+                Err(_) => return Err("agy /usage timed out".into()),
+            };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = if stdout.trim().is_empty() {
+            stderr.to_string()
+        } else {
+            stdout.to_string()
+        };
+        if text.trim().is_empty() {
+            Err("agy /usage returned empty output".into())
+        } else {
+            Ok(text)
+        }
+    }
+
+    // Prefer JSON form (same flags as Claude probe); fall back to tabular
+    // output used by scripts/quota/agy-limits.sh.
+    let text = match run_agy_usage(true).await {
+        Ok(t) => {
+            let parsed = parse_agy_usage_text(&t);
+            if matches!(parsed, QuotaProbeResult::Unknown { .. }) {
+                match run_agy_usage(false).await {
+                    Ok(t2) => t2,
+                    Err(_) => t,
+                }
+            } else {
+                return parsed;
+            }
+        }
+        Err(_) => match run_agy_usage(false).await {
+            Ok(t) => t,
+            Err(detail) => return QuotaProbeResult::Unknown { detail },
+        },
+    };
+    parse_agy_usage_text(&text)
 }
 
 #[cfg(test)]
