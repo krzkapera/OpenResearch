@@ -7710,6 +7710,11 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
 /// `launching_chat_session`) and `orx exp wake` can register the current chat.
 pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 
+/// Working-context label for tools that key off `BUS_SESSION` (e.g. ai-crew-sync
+/// `X-Crew-Session`). Same value as [`CHAT_SESSION_ENV`], under the name those
+/// configs conventionally expand.
+pub const BUS_SESSION_ENV: &str = "BUS_SESSION";
+
 /// Harness label paired with [`CHAT_SESSION_ENV`] for child telemetry.
 pub const CHAT_HARNESS_ENV: &str = "ORX_CHAT_HARNESS";
 
@@ -7841,6 +7846,7 @@ pub fn set_chat_session_env(
     up_port: Option<u16>,
 ) {
     cmd.env(CHAT_SESSION_ENV, session_id);
+    cmd.env(BUS_SESSION_ENV, session_id);
     cmd.env(CHAT_HARNESS_ENV, harness);
     cmd.env(LOCAL_SESSION_ENV, "1");
     // Never let a child inherit a port owned by some outer orx up process.
