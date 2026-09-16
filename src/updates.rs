@@ -1042,12 +1042,13 @@ const WARNING_LABEL: &str = "Warning:";
 /// warning is shown and no background refresh runs — the one escape hatch for
 /// anyone who can't tolerate the extra stderr line (including CI).
 fn opted_out() -> bool {
-    std::env::var_os("ORX_NO_UPDATE_CHECK").is_some()
-        // The generic convention honored by update-notifier and friends.
-        || std::env::var_os("NO_UPDATE_NOTIFIER").is_some()
-        // cargo-dist's own "don't manage updates for this install" switch; the
-        // installer already honors it, so it is the one mental model.
-        || std::env::var("OPENRESEARCH_CLI_DISABLE_UPDATE").as_deref() == Ok("1")
+    // krzkapera/OpenResearch fork: never self-update to stock alphaXiv releases.
+    // Stock 0.2.3+ can otherwise overwrite ~/.local/bin/orx (or /usr/local/bin/orx)
+    // on `orx up` when the install channel looks like the official installer.
+    // Env escapes still documented for operators: ORX_NO_UPDATE_CHECK,
+    // NO_UPDATE_NOTIFIER, OPENRESEARCH_CLI_DISABLE_UPDATE=1 — but this build
+    // always opts out regardless.
+    true
 }
 
 /// Whether to emit ANSI styling on stderr: only when stderr is a real terminal
