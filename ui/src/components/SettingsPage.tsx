@@ -872,6 +872,7 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
   const [partition, setPartition] = useState("");
   const [account, setAccount] = useState("");
   const [timeLimit, setTimeLimit] = useState("");
+  const [remoteRoot, setRemoteRoot] = useState("~/scratch/.orx");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [test, setTest] = useState<SlurmPreflight | null>(null);
@@ -893,6 +894,7 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
     setPartition(s.partition ?? "");
     setAccount(s.account ?? "");
     setTimeLimit(s.timeLimit ?? "");
+    setRemoteRoot(s.remoteRoot || "~/scratch/.orx");
   };
 
   const previousSettings = useRef<SlurmSettings | null>(null);
@@ -910,15 +912,17 @@ function SlurmSection({ remote = false }: { remote?: boolean }) {
       setPartition(settings.partition ?? "");
       setAccount(settings.account ?? "");
       setTimeLimit(settings.timeLimit ?? "");
+      setRemoteRoot(settings.remoteRoot || "~/scratch/.orx");
     }
-  }, [settings, host, partition, account, timeLimit]);
+  }, [settings, host, partition, account, timeLimit, remoteRoot]);
 
   const unchanged =
     settings !== null &&
     host === (settings.host ?? "") &&
     partition.trim() === (settings.partition ?? "") &&
     account.trim() === (settings.account ?? "") &&
-    timeLimit.trim() === (settings.timeLimit ?? "");
+    timeLimit.trim() === (settings.timeLimit ?? "") &&
+    remoteRoot.trim() === (settings.remoteRoot || "~/scratch/.orx");
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();

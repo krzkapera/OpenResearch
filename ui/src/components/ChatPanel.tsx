@@ -4634,7 +4634,12 @@ export function ChatPanel({
     const sessionId = openSession?.id;
     if (!sessionId || !autoResumeSupported) return;
     void queueSessionMutation(() => setChatSessionAutoResumeMutation.mutateAsync([sessionId, enabled]))
-      .then((session) => { if (session) applySession(session); })
+      .then((session) => {
+        if (!session) return;
+        setSessions((current) =>
+          current.map((candidate) => (candidate.id === session.id ? session : candidate)),
+        );
+      })
       .catch(() => undefined);
   };
 
