@@ -394,6 +394,13 @@ pub enum AgentCommand {
         #[arg(long)]
         no_wake: bool,
     },
+    /// Delete a finished spawned session: kills any leftover process, removes
+    /// its worktree, and drops its rows. A session may not delete itself —
+    /// only an ancestor may clean up a helper, once it is done.
+    Kill {
+        /// The spawned session id to delete (printed by `orx agent spawn`).
+        session_id: String,
+    },
 }
 
 #[derive(Args, Debug)]

@@ -2047,6 +2047,19 @@ pub(crate) async fn cancel_run_via_up(port: u16, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete a chat session through the resident `orx up`: it alone holds the
+/// live harness-process handles a plain CLI subprocess cannot reap itself.
+pub(crate) async fn delete_chat_session_via_up(port: u16, session_id: &str) -> Result<()> {
+    let response = authenticate_up_request(local_client()?.delete(format!(
+        "http://127.0.0.1:{port}/api/chat/sessions/{session_id}"
+    )))
+    .send()
+    .await
+    .map_err(|error| anyhow!("Could not reach the trusted orx up process: {error}"))?;
+    let _: Value = decode_local_response(response, "delete the session").await?;
+    Ok(())
+}
+
 async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>) -> ApiResult {
     reject_if_stopping(&state)?;
     reject_if_moving(&state)?;

@@ -14,13 +14,22 @@ orx agent spawn "<self-contained task>"
 orx agent spawn --title "<session title>" --stdin
 orx agent spawn "<task>" --harness <harness> --model <model>
 orx agent spawn "<task>" --no-wake
+orx agent kill <session-id>
 ```
 
 By default, this chat resumes with the helper's closing reply. Use `--no-wake`
-only when no follow-up is needed. A spawned session cannot spawn another helper,
-and the CLI enforces the number of helpers a session may have in flight. If the
-command refuses a spawn for either reason, do the work here or wait for a helper
-to finish.
+only when no follow-up is needed. A spawn chain may not go deeper than 4 levels
+below its root, and the CLI enforces the number of helpers a session may have
+in flight. If the command refuses a spawn for either reason, do the work here
+or wait for a helper to finish.
+
+## Clean up after a helper
+
+Nothing deletes a spawned session automatically — its row and worktree persist
+until removed. Once you have the helper's result and no longer need its
+worktree, delete it: `orx agent kill <session-id>`. A session may not delete
+itself — only an ancestor cleans up a helper, and only after that helper has
+actually finished; killing a still-working session ends its turn mid-flight.
 
 ## Choose tasks with a clean boundary
 

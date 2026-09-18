@@ -1,18 +1,25 @@
 //! The `agent` command group: delegate work to a second agent session.
 //!
-//!   orx agent spawn "<task>"   start a helper agent on its own top-level session
+//!   orx agent spawn "<task>"        start a helper agent on its own top-level session
+//!   orx agent kill <session-id>     delete a finished helper session
 //!
 //! Only meaningful inside a local `orx up` agent session. `ORX_LOCAL_SESSION`
 //! marks the process as one; `ORX_CHAT_SESSION_ID` names the session doing the
 //! spawning (see `local::chat::set_chat_session_env`). Both are needed — the
 //! cloud opencode plugin exports the session id too, for run attribution.
 //!
-//! This command only writes the child's session row and a `chat_spawns` record;
-//! it never runs the child itself. The resident `orx up` picks the record up,
+//! `spawn` only writes the child's session row and a `chat_spawns` record; it
+//! never runs the child itself. The resident `orx up` picks the record up,
 //! starts the helper's first turn, and (unless `--no-wake`) wakes the parent
 //! when the helper is done. Same store-and-watcher split as `orx exp wake`, and for
 //! the same reason: the CLI is a short-lived subprocess with no harness of its
 //! own to run a turn on.
+//!
+//! `kill` is different: nothing about it can be a plain store write, because
+//! reaping a still-live harness process means calling into the resident
+//! `orx up`'s in-memory `ChatHost`, which only that process holds a handle to.
+//! It refuses to delete the calling session itself — cleanup is an ancestor's
+//! job, done once the helper has already reported back.
 
 use std::io::Read;
 
@@ -36,6 +43,7 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
             model,
             no_wake,
         } => spawn(&store, task, stdin, title, harness, model, !no_wake),
+        AgentCommand::Kill { session_id } => kill(session_id).await,
     }
 }
 
@@ -67,17 +75,38 @@ fn non_empty(text: String) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
+/// Maximum spawn-chain depth: a root (never-spawned) session is depth 0. A
+/// session may spawn a helper only while its own depth is below this, so a
+/// chain can never grow past `MAX_SPAWN_DEPTH` levels below its root.
+pub(crate) const MAX_SPAWN_DEPTH: u32 = 4;
+
+/// How many spawn-ancestors `session` has, walking `parent_session_id` back
+/// towards a root. Stops as soon as it reaches `MAX_SPAWN_DEPTH`, since a
+/// caller past that point only needs "too deep", not the exact count.
+fn spawn_depth(store: &Store, session: &StoredChatSession) -> Result<u32> {
+    let mut depth = 0;
+    let mut current = session.parent_session_id.clone();
+    while let Some(id) = current {
+        depth += 1;
+        if depth >= MAX_SPAWN_DEPTH {
+            return Ok(depth);
+        }
+        current = store
+            .get_chat_session(&id)?
+            .and_then(|ancestor| ancestor.parent_session_id);
+    }
+    Ok(depth)
+}
+
 /// Why this session may not spawn right now, if it may not. Depth and breadth
-/// are the two ways one request becomes an unbounded tree of paid sessions, and
-/// nothing downstream of here bounds either.
-fn spawn_refusal(parent: &StoredChatSession, live: i64) -> Option<String> {
-    if parent.parent_session_id.is_some() {
-        return Some(
-            "This session was itself spawned by another agent, and spawned agents cannot spawn \
-             their own. Do the task here, or report back so the session that spawned you can \
-             delegate it."
-                .to_string(),
-        );
+/// are the two ways one request becomes an unbounded tree of paid sessions:
+/// depth is capped at `MAX_SPAWN_DEPTH`, breadth at `MAX_LIVE_SPAWNS`.
+fn spawn_refusal(depth: u32, live: i64) -> Option<String> {
+    if depth >= MAX_SPAWN_DEPTH {
+        return Some(format!(
+            "This session is already {depth} spawn levels deep, the most a chain may go. Do the \
+             task here, or report back so an ancestor session can delegate it."
+        ));
     }
     (live >= MAX_LIVE_SPAWNS).then(|| {
         format!(
@@ -107,7 +136,8 @@ fn spawn(
         .get_chat_session(&parent_id)?
         .ok_or_else(|| anyhow!("The current chat session no longer exists."))?;
     let prompt = task_text(task, stdin)?;
-    if let Some(refusal) = spawn_refusal(&parent, store.count_live_chat_spawns(&parent_id)?) {
+    let depth = spawn_depth(store, &parent)?;
+    if let Some(refusal) = spawn_refusal(depth, store.count_live_chat_spawns(&parent_id)?) {
         return Err(anyhow!(refusal));
     }
     let harness = harness.unwrap_or_else(|| parent.harness.clone());
@@ -179,14 +209,39 @@ fn spawn(
     Ok(())
 }
 
+/// Delete a finished session. Refuses to delete the caller's own session —
+/// only an ancestor may clean up a helper, and only once it is done; deleting
+/// a still-live session out from under itself would kill its own turn.
+async fn kill(session_id: String) -> Result<()> {
+    if !crate::local::chat::in_local_session() {
+        return Err(anyhow!(
+            "`orx agent kill` is only available inside a local `orx up` agent session."
+        ));
+    }
+    let caller_id = crate::local::chat::launching_chat_session()
+        .ok_or_else(|| anyhow!("This agent session has no chat id to kill from."))?;
+    if session_id == caller_id {
+        return Err(anyhow!(
+            "A session may not delete itself. Let the session that spawned you (or another \
+             ancestor) delete you once you have reported back."
+        ));
+    }
+    let port = crate::local::chat::trusted_up_port()?.ok_or_else(|| {
+        anyhow!("This agent session lost its link to the orx up server; restart `orx up`.")
+    })?;
+    crate::commands::up::delete_chat_session_via_up(port, &session_id).await?;
+    println!("Deleted session {session_id}.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{spawn_refusal, task_text, MAX_LIVE_SPAWNS};
-    use crate::store::StoredChatSession;
+    use super::{spawn_depth, spawn_refusal, task_text, MAX_LIVE_SPAWNS, MAX_SPAWN_DEPTH};
+    use crate::store::{Store, StoredChatSession};
 
-    fn parent(parent_session_id: Option<&str>) -> StoredChatSession {
+    fn session(id: &str, parent_session_id: Option<&str>) -> StoredChatSession {
         StoredChatSession {
-            id: "chat_parent".into(),
+            id: id.into(),
             project_id: "p1".into(),
             harness: "codex".into(),
             native_session_id: None,
@@ -209,21 +264,60 @@ mod tests {
         }
     }
 
+    fn temp_store(name: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("orx-agent-{name}-{}", uuid::Uuid::new_v4()));
+        (Store::open_at(dir.clone()).unwrap(), dir)
+    }
+
     #[test]
-    fn a_spawned_session_may_not_spawn_its_own() {
-        let refusal = spawn_refusal(&parent(Some("chat_grandparent")), 0)
-            .expect("a spawned session must be refused");
-        assert!(refusal.contains("cannot spawn"), "{refusal}");
-        // Depth is refused regardless of how few helpers are in flight.
-        assert!(spawn_refusal(&parent(None), 0).is_none());
+    fn spawn_is_refused_at_max_depth_regardless_of_breadth() {
+        let refusal = spawn_refusal(MAX_SPAWN_DEPTH, 0).expect("max depth must be refused");
+        assert!(refusal.contains("levels deep"), "{refusal}");
+        assert!(spawn_refusal(MAX_SPAWN_DEPTH - 1, 0).is_none());
     }
 
     #[test]
     fn one_session_may_only_run_so_many_helpers_at_once() {
-        assert!(spawn_refusal(&parent(None), MAX_LIVE_SPAWNS - 1).is_none());
-        let refusal =
-            spawn_refusal(&parent(None), MAX_LIVE_SPAWNS).expect("the cap must refuse one more");
+        assert!(spawn_refusal(0, MAX_LIVE_SPAWNS - 1).is_none());
+        let refusal = spawn_refusal(0, MAX_LIVE_SPAWNS).expect("the cap must refuse one more");
         assert!(refusal.contains("in flight"), "{refusal}");
+    }
+
+    #[test]
+    fn spawn_depth_counts_a_shallow_chain_exactly() {
+        let (store, dir) = temp_store("depth-shallow");
+        let root = session("chat_root", None);
+        store.create_chat_session(&root).unwrap();
+        let child = session("chat_child", Some("chat_root"));
+        store.create_chat_session(&child).unwrap();
+        let grandchild = session("chat_grandchild", Some("chat_child"));
+
+        assert_eq!(spawn_depth(&store, &root).unwrap(), 0);
+        assert_eq!(spawn_depth(&store, &child).unwrap(), 1);
+        assert_eq!(spawn_depth(&store, &grandchild).unwrap(), 2);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spawn_depth_stops_walking_at_the_cap() {
+        let (store, dir) = temp_store("depth-cap");
+        let mut previous_id: Option<String> = None;
+        let mut last = session("chat_0", None);
+        for i in 0..(MAX_SPAWN_DEPTH + 2) {
+            let current = session(&format!("chat_{i}"), previous_id.as_deref());
+            store.create_chat_session(&current).unwrap();
+            previous_id = Some(current.id.clone());
+            last = current;
+        }
+
+        // The chain is deeper than the cap; the walk must stop counting there,
+        // not report the true (longer) depth.
+        assert_eq!(spawn_depth(&store, &last).unwrap(), MAX_SPAWN_DEPTH);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
