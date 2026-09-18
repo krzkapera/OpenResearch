@@ -1,5 +1,5 @@
 //! The harness compatibility layer: one `Harness` trait that every coding-agent
-//! integration (Claude Code, Codex, OpenCode, Cursor) implements, plus the
+//! integration (Claude Code, Codex, OpenCode, Cursor, Antigravity) implements, plus the
 //! single `registry()` that every consumer iterates.
 //!
 //! A harness can offer up to three capabilities, and no harness is required to
@@ -825,20 +825,21 @@ mod tests {
             permission_contract(&antigravity),
             [
                 (
-                    "ask",
-                    "Ask",
-                    "Prompt before running commands or modifying files"
+                    "default",
+                    "Ask for approval",
+                    "Ask before changes; allow read-only planning"
                 ),
-                ("auto", "Auto", "Allow actions unless explicitly denied"),
                 (
                     "bypass",
-                    "Bypass",
+                    "Bypass permissions",
                     "Allow commands and skip tool confirmation prompts"
                 ),
             ]
         );
-        assert_eq!(antigravity.default_permission_mode, Some("auto"));
+        assert_eq!(antigravity.default_permission_mode, Some("default"));
         assert_eq!(antigravity.plan_activation, Some(PlanActivation::Command));
+        // Reasoning levels are fork-added (agy `--effort`), independent of the
+        // upstream permission-mode set kept above.
         assert_eq!(
             reasoning_ids(&antigravity),
             ["default", "low", "medium", "high"]

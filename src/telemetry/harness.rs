@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::Value;
 
-pub(crate) const IDS: [&str; 4] = ["claude-code", "codex", "opencode", "cursor"];
+pub(crate) const IDS: [&str; 5] = ["claude-code", "codex", "opencode", "cursor", "antigravity"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InitialSnapshot {
@@ -33,7 +33,7 @@ fn state(id: &str, h: &Value) -> Value {
         "installation": if broken { "broken" } else { match installed { Some(true) => "installed", Some(false) => "not_installed", None => "unknown" } },
         "auth": auth_state,
         "authEvidence": if !checked || auth_state == "unverifiable" { "none" }
-            else if matches!(id, "claude-code" | "cursor") && h["authMethod"] != "apiKey" { "cli_status" } else { "configuration" },
+            else if matches!(id, "claude-code" | "cursor" | "antigravity") && h["authMethod"] != "apiKey" { "cli_status" } else { "configuration" },
         "compatibility": if auth == Some("unsupported") { "update_required" } else if checked && h["version"].is_string() { "no_known_requirement" } else { "unknown" },
         "usability": if h["agentReady"] == true { "usable" } else if auth_state == "unverifiable" || installed.is_none() { "unknown" } else { "unavailable" },
         "localConfigured": h["authMethod"] == "local",
@@ -167,6 +167,8 @@ fn safe_error_excerpt(output: &str) -> Option<String> {
         "Read-only file system",
         "No such file or directory",
         "command not found",
+        "is not recognized as the name of a cmdlet",
+        "running scripts is disabled on this system",
         "Unsupported platform",
         "Unsupported architecture",
         "The requested URL returned error: 403",
@@ -182,9 +184,14 @@ fn safe_error_excerpt(output: &str) -> Option<String> {
         "ENOSPC",
         "ECONNRESET",
     ];
+    let output = output
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
     let phrases: Vec<_> = PHRASES
         .iter()
-        .filter(|phrase| output.contains(**phrase))
+        .filter(|phrase| output.contains(&phrase.to_ascii_lowercase()))
         .copied()
         .collect();
     (!phrases.is_empty()).then(|| phrases.join("; "))
@@ -206,7 +213,7 @@ mod tests {
             &json!({"harnesses":[{"id":"opencode","installed":true}]}),
         );
         assert_eq!(first, restarted.harness_snapshot.unwrap().payload);
-        assert_eq!(first["events"].as_array().unwrap().len(), 4);
+        assert_eq!(first["events"].as_array().unwrap().len(), IDS.len());
     }
     #[test]
     fn distinguishes_free_auth_unknown_and_unsupported() {
@@ -232,6 +239,22 @@ mod tests {
         assert_eq!(
             safe_error_excerpt("curl: (22) The requested URL returned error: 403 secret"),
             Some("The requested URL returned error: 403".into())
+        );
+    }
+
+    #[test]
+    fn wrapped_and_mixed_case_errors_keep_only_fixed_diagnostics() {
+        assert_eq!(
+            safe_error_excerpt("npm : The term 'npm' is not recognized as the name of a cmdlet, function, script file, or operable program. C:\\Users\\private"),
+            Some("is not recognized as the name of a cmdlet".into())
+        );
+        assert_eq!(
+            safe_error_excerpt("C:\\Users\\private\\npm.ps1 cannot be loaded because running scripts is\r\n disabled on this system."),
+            Some("running scripts is disabled on this system".into())
+        );
+        assert_eq!(
+            safe_error_excerpt("ERROR: permission denied for secret-token"),
+            Some("Permission denied".into())
         );
     }
 }

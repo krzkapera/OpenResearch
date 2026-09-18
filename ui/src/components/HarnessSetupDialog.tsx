@@ -20,6 +20,7 @@ export function HarnessSetupDialog({ harness, commands, onReady, onClose }: {
   const [phase, setPhase] = useState<"preview" | "running" | "checking" | "success" | "error">(action === "login" ? "running" : "preview");
   const [error, setError] = useState<string | null>(null);
   const busy = phase === "running" || phase === "checking";
+  const command = commands[action].includes("\n") ? undefined : commands[action];
 
   useEffect(() => {
     cancelled.current = false;
@@ -40,6 +41,7 @@ export function HarnessSetupDialog({ harness, commands, onReady, onClose }: {
       if (current?.agentReady && (action !== "login" || current.authenticated)) {
         onReady?.(current);
         setPhase("success");
+        if (harness.id === "antigravity" && action === "login") onClose();
       } else if (action !== "login" && current?.installed && !current.installBroken && current.authState === "needsLogin") {
         setAction("login");
         setPhase("running");
@@ -77,11 +79,11 @@ export function HarnessSetupDialog({ harness, commands, onReady, onClose }: {
         <p className="my-4 text-sm text-subtext">
           {action === "install" ? m.harness_setup_install_preview({ agent: harness.name }) : m.harness_setup_update_preview({ agent: harness.name })}
         </p>
-      ) : (
+      ) : command ? (
         <p className="my-4 text-sm text-subtext [&_.cmd-inline]:mx-2 [&_.cmd-inline]:gap-2">
-          {renderNote(m.harness_setup_started_command({ command: commands[action] }))}
+          {renderNote(m.harness_setup_started_command({ command }))}
         </p>
-      )}
+      ) : null}
       {phase !== "running" && phase !== "preview" && (
         <p className="my-4 flex items-center gap-2 text-sm" role="status">
           {phase === "checking" && <Spinner />}
@@ -98,9 +100,9 @@ export function HarnessSetupDialog({ harness, commands, onReady, onClose }: {
       <CommandTerminal
         key={`${action}-${attempt}`}
         path={`/api/harnesses/setup?${new URLSearchParams({ harness: harness.id, action })}`}
-        label={commands[action]}
-        command={commands[action]}
-        heightClass="h-80"
+        label={m.harness_setup_title({ agent: harness.name })}
+        command={command}
+        heightClass="h-96"
         active={phase === "running"}
         awaitingApproval={phase === "preview"}
         onComplete={(value) => {
