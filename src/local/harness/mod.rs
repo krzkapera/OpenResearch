@@ -49,12 +49,16 @@ pub use plan_gate::decide as plan_gate_decide;
 pub use quota::QuotaProbeResult;
 
 /// A turn with NO events for this long is treated as wedged and interrupted
-/// rather than held busy forever. Known false positive: a command that is
-/// legitimately silent this long (a quiet build, a training step with
-/// buffered output) is indistinguishable from a hang — hence the generous
-/// bound; the interruption is a clear, recoverable error either way. Shared
-/// by the codex and claude adapters (each applies it to its own event wait).
-pub(crate) const TURN_WATCHDOG: Duration = Duration::from_secs(30 * 60);
+/// rather than held busy forever. Upstream this was 30 minutes, which killed
+/// a turn blocked on a legitimately long wait (e.g. an MCP tool call polling
+/// a teammate for up to hours) exactly as if it had actually hung — this fork
+/// widens it to a year, which is "no practical limit" without the overflow
+/// risk of `Instant::now() + Duration::MAX`. A genuinely wedged child (dead
+/// process, stuck refresh) is still caught: FIRST_EVENT_TIMEOUT covers a
+/// child that never starts, and a truly dead child's connection drops rather
+/// than staying silent. Shared by the claude, codex, cursor and antigravity
+/// adapters (each applies it to its own event wait / write / exit).
+pub(crate) const TURN_WATCHDOG: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
 pub(crate) const ORX_MAX_RETRIES: u32 = 3;
 pub(crate) const ORX_MAX_ATTEMPTS: u32 = ORX_MAX_RETRIES + 1;
