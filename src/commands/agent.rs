@@ -44,6 +44,7 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
             permission_mode,
             reasoning_level,
             service_tier,
+            plan_mode,
             no_wake,
         } => spawn(
             &store,
@@ -56,6 +57,7 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
                 permission_mode,
                 reasoning_level,
                 service_tier,
+                plan_mode,
             },
             !no_wake,
         ),
@@ -140,6 +142,7 @@ struct SpawnSettings {
     permission_mode: Option<String>,
     reasoning_level: Option<String>,
     service_tier: Option<String>,
+    plan_mode: bool,
 }
 
 fn spawn(
@@ -156,6 +159,7 @@ fn spawn(
         permission_mode,
         reasoning_level,
         service_tier,
+        plan_mode,
     } = settings;
     if !crate::local::chat::in_local_session() {
         return Err(anyhow!(
@@ -192,6 +196,9 @@ fn spawn(
     {
         return Err(anyhow!("invalid service tier for selected harness"));
     }
+    if plan_mode && !crate::local::harness::supports_command_plan(&harness) {
+        return Err(anyhow!("this harness activates Plan through permissions"));
+    }
     // Settings only carry over when the child runs the same harness; a model or
     // permission-mode id from one CLI is meaningless to another. An explicit
     // flag always wins over both the parent and the harness default.
@@ -227,7 +234,7 @@ fn spawn(
                 .flatten()
                 .filter(|mode| Some(mode) != plan_permission.as_ref())
         }),
-        plan_mode: false,
+        plan_mode,
         plan_reset_pending: false,
         reasoning_level: reasoning_level
             .or_else(|| inherits.then(|| parent.reasoning_level.clone()).flatten()),

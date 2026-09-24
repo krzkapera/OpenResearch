@@ -410,6 +410,12 @@ pub enum AgentCommand {
         /// and model are both unchanged, otherwise the harness's own default.
         #[arg(long = "service-tier")]
         service_tier: Option<String>,
+        /// Start the helper in Plan mode. Only meaningful on harnesses that
+        /// activate Plan through a command rather than a permission mode
+        /// (Codex, OpenCode) — on others, pass a plan-activating value to
+        /// `--permission-mode` instead.
+        #[arg(long = "plan-mode")]
+        plan_mode: bool,
         /// Do not resume this chat when the helper finishes.
         #[arg(long)]
         no_wake: bool,
