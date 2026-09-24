@@ -50,11 +50,13 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
             task,
             stdin,
             title,
-            harness,
-            model,
-            permission_mode,
-            reasoning_level,
-            service_tier,
+            SpawnSettings {
+                harness,
+                model,
+                permission_mode,
+                reasoning_level,
+                service_tier,
+            },
             !no_wake,
         ),
         AgentCommand::Kill { session_id } => kill(session_id).await,
@@ -130,18 +132,31 @@ fn spawn_refusal(depth: u32, live: i64) -> Option<String> {
     })
 }
 
-fn spawn(
-    store: &Store,
-    task: Option<String>,
-    stdin: bool,
-    title: Option<String>,
+/// The session-settings axes a spawn may override; every field falls back to
+/// the parent's own setting (same harness only) or the harness default.
+struct SpawnSettings {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
     reasoning_level: Option<String>,
     service_tier: Option<String>,
+}
+
+fn spawn(
+    store: &Store,
+    task: Option<String>,
+    stdin: bool,
+    title: Option<String>,
+    settings: SpawnSettings,
     wake_parent: bool,
 ) -> Result<()> {
+    let SpawnSettings {
+        harness,
+        model,
+        permission_mode,
+        reasoning_level,
+        service_tier,
+    } = settings;
     if !crate::local::chat::in_local_session() {
         return Err(anyhow!(
             "`orx agent spawn` is only available inside a local `orx up` agent session."
