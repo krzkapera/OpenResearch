@@ -393,6 +393,23 @@ pub enum AgentCommand {
         /// Model for the helper (defaults to this session's).
         #[arg(long)]
         model: Option<String>,
+        /// Permission mode for the helper (e.g. `plan`, `accept-edits`,
+        /// `bypass` — the valid set depends on the harness). Defaults to
+        /// inheriting the parent's when the harness is unchanged, otherwise
+        /// the harness's own default.
+        #[arg(long = "permission-mode")]
+        permission_mode: Option<String>,
+        /// Reasoning/thinking effort for the helper (e.g. `low`, `high` —
+        /// the valid set depends on the harness and model). Defaults to
+        /// inheriting the parent's when the harness is unchanged, otherwise
+        /// the harness's own default.
+        #[arg(long = "reasoning-level")]
+        reasoning_level: Option<String>,
+        /// Service tier / speed setting for the helper, on harnesses that
+        /// have one. Defaults to inheriting the parent's when the harness
+        /// and model are both unchanged, otherwise the harness's own default.
+        #[arg(long = "service-tier")]
+        service_tier: Option<String>,
         /// Do not resume this chat when the helper finishes.
         #[arg(long)]
         no_wake: bool,

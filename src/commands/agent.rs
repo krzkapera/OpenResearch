@@ -41,8 +41,22 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
             title,
             harness,
             model,
+            permission_mode,
+            reasoning_level,
+            service_tier,
             no_wake,
-        } => spawn(&store, task, stdin, title, harness, model, !no_wake),
+        } => spawn(
+            &store,
+            task,
+            stdin,
+            title,
+            harness,
+            model,
+            permission_mode,
+            reasoning_level,
+            service_tier,
+            !no_wake,
+        ),
         AgentCommand::Kill { session_id } => kill(session_id).await,
     }
 }
@@ -123,6 +137,9 @@ fn spawn(
     title: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    permission_mode: Option<String>,
+    reasoning_level: Option<String>,
+    service_tier: Option<String>,
     wake_parent: bool,
 ) -> Result<()> {
     if !crate::local::chat::in_local_session() {
@@ -144,8 +161,25 @@ fn spawn(
     if !crate::local::harness::is_chat_harness(&harness) {
         return Err(anyhow!("unknown harness: {harness}"));
     }
+    let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
+    let permission_mode = nonempty(permission_mode);
+    let reasoning_level = nonempty(reasoning_level);
+    let service_tier = nonempty(service_tier);
+    if permission_mode
+        .as_deref()
+        .is_some_and(|mode| crate::local::harness::permission_mode_for(&harness, mode).is_none())
+    {
+        return Err(anyhow!("invalid permission mode for selected harness"));
+    }
+    if service_tier
+        .as_deref()
+        .is_some_and(|tier| crate::local::harness::service_tier_for(&harness, tier).is_none())
+    {
+        return Err(anyhow!("invalid service tier for selected harness"));
+    }
     // Settings only carry over when the child runs the same harness; a model or
-    // permission-mode id from one CLI is meaningless to another.
+    // permission-mode id from one CLI is meaningless to another. An explicit
+    // flag always wins over both the parent and the harness default.
     let inherits = harness == parent.harness;
     let changes_model = model
         .as_deref()
@@ -167,16 +201,21 @@ fn spawn(
         title_source: title.is_some().then(|| "user".to_string()),
         title,
         model: model.or_else(|| inherits.then(|| parent.model.clone()).flatten()),
-        service_tier: (inherits && !changes_model)
-            .then(|| parent.service_tier.clone())
-            .flatten(),
-        permission_mode: inherits
-            .then(|| parent.permission_mode.clone())
-            .flatten()
-            .filter(|mode| Some(mode) != plan_permission.as_ref()),
+        service_tier: service_tier.or_else(|| {
+            (inherits && !changes_model)
+                .then(|| parent.service_tier.clone())
+                .flatten()
+        }),
+        permission_mode: permission_mode.or_else(|| {
+            inherits
+                .then(|| parent.permission_mode.clone())
+                .flatten()
+                .filter(|mode| Some(mode) != plan_permission.as_ref())
+        }),
         plan_mode: false,
         plan_reset_pending: false,
-        reasoning_level: inherits.then(|| parent.reasoning_level.clone()).flatten(),
+        reasoning_level: reasoning_level
+            .or_else(|| inherits.then(|| parent.reasoning_level.clone()).flatten()),
         archived: false,
         context_usage_json: None,
         bootstrap_context: None,
