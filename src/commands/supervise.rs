@@ -1094,6 +1094,7 @@ async fn run_slurm(
                 message: Some(
                     "job left the queue without an exit code (killed or node lost?)".to_string(),
                 ),
+                exit_code: None,
             };
         } else {
             gone_polls = 0;
@@ -1102,7 +1103,7 @@ async fn run_slurm(
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
         if is_terminal_stage(stage) {
-            let applied = store.update_status(&run_id, status, Some(now_ms()), None)?;
+            let applied = store.update_status(&run_id, status, Some(now_ms()), job.exit_code)?;
             if applied && status == RunStatus::Failed {
                 if let Some(msg) = &job.message {
                     if let Err(err) =

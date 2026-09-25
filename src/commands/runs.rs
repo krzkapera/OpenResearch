@@ -47,6 +47,8 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
                     Some(sha) => sha.chars().take(7).collect::<String>(),
                     None => "—".to_string(),
                 },
+                r.exit_code
+                    .map_or_else(|| "—".to_string(), |code| code.to_string()),
                 format_duration(r.duration_secs),
                 r.updated_display.clone(),
             ]
@@ -59,6 +61,7 @@ pub async fn run(args: crate::RunsArgs) -> Result<()> {
             "STATUS",
             "EXPERIMENT",
             "COMMIT",
+            "EXIT",
             "DURATION",
             "UPDATED",
         ],

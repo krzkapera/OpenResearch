@@ -116,6 +116,28 @@ fn spawn_depth(store: &Store, session: &StoredChatSession) -> Result<u32> {
     Ok(depth)
 }
 
+/// Whether `ancestor_id` appears on `session`'s spawn chain (its parent, the
+/// parent's parent, …). Bounded so a corrupt cycle cannot loop forever.
+fn is_spawn_ancestor(
+    store: &Store,
+    ancestor_id: &str,
+    session: &StoredChatSession,
+) -> Result<bool> {
+    let mut current = session.parent_session_id.clone();
+    for _ in 0..=MAX_SPAWN_DEPTH {
+        let Some(id) = current else {
+            return Ok(false);
+        };
+        if id == ancestor_id {
+            return Ok(true);
+        }
+        current = store
+            .get_chat_session(&id)?
+            .and_then(|ancestor| ancestor.parent_session_id);
+    }
+    Ok(false)
+}
+
 /// Why this session may not spawn right now, if it may not. Depth and breadth
 /// are the two ways one request becomes an unbounded tree of paid sessions:
 /// depth is capped at `MAX_SPAWN_DEPTH`, breadth at `MAX_LIVE_SPAWNS`.
@@ -287,6 +309,15 @@ async fn kill(session_id: String) -> Result<()> {
              ancestor) delete you once you have reported back."
         ));
     }
+    let store = Store::open()?;
+    let target = store
+        .get_chat_session(&session_id)?
+        .ok_or_else(|| anyhow!("No chat session {session_id}."))?;
+    if !is_spawn_ancestor(&store, &caller_id, &target)? {
+        return Err(anyhow!(
+            "A session may only delete helpers it spawned, directly or through its own helpers."
+        ));
+    }
     let port = crate::local::chat::trusted_up_port()?.ok_or_else(|| {
         anyhow!("This agent session lost its link to the orx up server; restart `orx up`.")
     })?;
@@ -297,7 +328,9 @@ async fn kill(session_id: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{spawn_depth, spawn_refusal, task_text, MAX_LIVE_SPAWNS, MAX_SPAWN_DEPTH};
+    use super::{
+        is_spawn_ancestor, spawn_depth, spawn_refusal, task_text, MAX_LIVE_SPAWNS, MAX_SPAWN_DEPTH,
+    };
     use crate::store::{Store, StoredChatSession};
 
     fn session(id: &str, parent_session_id: Option<&str>) -> StoredChatSession {
@@ -356,6 +389,27 @@ mod tests {
         assert_eq!(spawn_depth(&store, &root).unwrap(), 0);
         assert_eq!(spawn_depth(&store, &child).unwrap(), 1);
         assert_eq!(spawn_depth(&store, &grandchild).unwrap(), 2);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_spawn_ancestors_may_kill_a_session() {
+        let (store, dir) = temp_store("kill-ancestry");
+        let root = session("chat_root", None);
+        store.create_chat_session(&root).unwrap();
+        let child = session("chat_child", Some("chat_root"));
+        store.create_chat_session(&child).unwrap();
+        let grandchild = session("chat_grandchild", Some("chat_child"));
+        store.create_chat_session(&grandchild).unwrap();
+        let unrelated = session("chat_other", None);
+
+        assert!(is_spawn_ancestor(&store, "chat_child", &grandchild).unwrap());
+        assert!(is_spawn_ancestor(&store, "chat_root", &grandchild).unwrap());
+        assert!(!is_spawn_ancestor(&store, "chat_grandchild", &child).unwrap());
+        assert!(!is_spawn_ancestor(&store, "chat_other", &grandchild).unwrap());
+        assert!(!is_spawn_ancestor(&store, "chat_root", &unrelated).unwrap());
 
         drop(store);
         let _ = std::fs::remove_dir_all(dir);

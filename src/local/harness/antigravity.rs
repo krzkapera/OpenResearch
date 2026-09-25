@@ -430,7 +430,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     if ctx.plan_mode {
         cmd.arg("--mode=plan");
     }
-    cmd.args(["--print-timeout", "60m"]);
+    // No cap: agents wait on the bus for hours within one turn, and a timeout
+    // ends the turn mid-wait while orx records it as completed.
+    cmd.args(["--print-timeout", "0"]);
 
     if let Some(native_id) = &resume {
         cmd.args(["--conversation", native_id]);

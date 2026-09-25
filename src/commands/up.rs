@@ -777,6 +777,13 @@ fn remote_route_forbidden(path: &str) -> bool {
 }
 
 fn is_remote_callback_route(method: &Method, path: &str) -> bool {
+    let single_segment = |id: &str| !id.is_empty() && !id.contains('/');
+    if method == Method::DELETE {
+        // `orx agent kill`; the CLI only lets a session delete its own helpers.
+        return path
+            .strip_prefix("/api/chat/sessions/")
+            .is_some_and(single_segment);
+    }
     if method != Method::POST {
         return false;
     }
@@ -784,7 +791,7 @@ fn is_remote_callback_route(method: &Method, path: &str) -> bool {
         || path
             .strip_prefix("/api/runs/")
             .and_then(|path| path.strip_suffix("/cancel"))
-            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+            .is_some_and(single_segment)
 }
 
 // --- error plumbing -------------------------------------------------------
@@ -8166,7 +8173,27 @@ mod tests {
     }
 
     #[test]
-    fn remote_callback_token_is_limited_to_run_submission_and_cancellation() {
+    fn remote_callback_token_is_limited_to_runs_and_helper_deletion() {
+        assert!(is_remote_callback_route(
+            &Method::DELETE,
+            "/api/chat/sessions/s1"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::DELETE,
+            "/api/chat/sessions/"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::DELETE,
+            "/api/chat/sessions/s1/worktree"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::DELETE,
+            "/api/projects/p1"
+        ));
+        assert!(!is_remote_callback_route(
+            &Method::GET,
+            "/api/chat/sessions/s1"
+        ));
         assert!(is_remote_callback_route(&Method::POST, "/api/runs"));
         assert!(is_remote_callback_route(
             &Method::POST,

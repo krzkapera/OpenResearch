@@ -273,6 +273,8 @@ pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
 pub struct JobState {
     pub stage: String,
     pub message: Option<String>,
+    /// The payload's exit code, read from the run dir's `exit_code` file.
+    pub exit_code: Option<i64>,
 }
 
 /// One combined remote probe emitting a single token — exit_code first
@@ -308,6 +310,7 @@ fn map_inspect_token(out: &str) -> JobState {
     let state = |stage: &str, message: Option<String>| JobState {
         stage: stage.to_string(),
         message,
+        exit_code: None,
     };
     if let Some(code) = out.strip_prefix("EXIT ") {
         // An empty file is the window between open(O_TRUNC) and the write —
@@ -315,11 +318,16 @@ fn map_inspect_token(out: &str) -> JobState {
         if code.trim().is_empty() {
             return state("RUNNING", None);
         }
-        let code: i32 = code.trim().parse().unwrap_or(-1);
-        return if code == 0 {
+        let parsed: Option<i64> = code.trim().parse().ok();
+        let code = parsed.unwrap_or(-1);
+        let verdict = if code == 0 {
             state("COMPLETED", None)
         } else {
             state("ERROR", Some(format!("exited with code {code}")))
+        };
+        return JobState {
+            exit_code: parsed,
+            ..verdict
         };
     }
     // `squeue %T` / `sacct -P State` values. sacct suffixes cancellations
@@ -513,9 +521,13 @@ mod tests {
     #[test]
     fn inspect_token_mapping() {
         assert_eq!(map_inspect_token("EXIT 0").stage, "COMPLETED");
+        assert_eq!(map_inspect_token("EXIT 0").exit_code, Some(0));
         let failed = map_inspect_token("EXIT 137");
         assert_eq!(failed.stage, "ERROR");
+        assert_eq!(failed.exit_code, Some(137));
         assert!(failed.message.unwrap().contains("137"));
+        assert_eq!(map_inspect_token("EXIT garbage").exit_code, None);
+        assert_eq!(map_inspect_token("SQ RUNNING").exit_code, None);
         // Empty exit_code = caught mid-write; not a verdict.
         assert_eq!(map_inspect_token("EXIT ").stage, "RUNNING");
         assert_eq!(map_inspect_token("SQ PENDING").stage, "SCHEDULING");
