@@ -76,6 +76,10 @@ pub async fn submit_local_slurm_with_source(
     let remote_root = slurm::effective_remote_root(&settings);
     let remote_root_norm = slurm::normalize_remote_root(&remote_root);
 
+    // `--timeout` beats the settings default; neither = the cluster's default.
+    let time_limit_secs =
+        slurm::resolve_time_limit(args.timeout.as_deref(), settings.time_limit.as_deref())?;
+
     let store = Store::open()?;
     let exp = store
         .get_local_experiment(&args.exp_id)?
@@ -100,6 +104,7 @@ pub async fn submit_local_slurm_with_source(
         &source.path,
         &source.digest,
         &remote_root_norm,
+        None,
     )
     .await?;
     let job_id = slurm::run_job(&slurm::SlurmJobSpec {
@@ -107,10 +112,14 @@ pub async fn submit_local_slurm_with_source(
         run_id: run_id.clone(),
         remote_root: remote_root.clone(),
         sbatch_path: "job.sbatch".to_string(),
+        time_limit_secs,
     })
     .await?;
 
     let mut descriptor = BackendDescriptor {
+        ssh_container: None,
+        monitoring_error: None,
+        cancellation_accepted: false,
         kind: "slurm_job".to_string(),
         namespace: Some(host.clone()),
         job_id: Some(job_id.clone()),
@@ -123,7 +132,7 @@ pub async fn submit_local_slurm_with_source(
         ssh_host: None,
         ssh_port: None,
         ssh_user: None,
-        timeout_secs: None,
+        timeout_secs: time_limit_secs,
         source_digest: None,
         source_path: None,
         source_size: None,

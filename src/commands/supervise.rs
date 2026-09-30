@@ -24,6 +24,8 @@ use crate::store::{log_path, now_ms, RunStatus, Store};
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
+/// How long monitoring must keep failing before it is reported on the run.
+const MONITORING_GRACE: Duration = Duration::from_secs(60);
 
 fn open_supervisor_lock(path: &std::path::Path) -> Result<fd_lock::RwLock<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
@@ -584,7 +586,15 @@ async fn run_ssh(
     eprintln!("supervise {run_id}: watching ssh job {host}:{dir}");
     let target = ssh::SshTarget::alias(host);
     let dir = dir.to_string();
-    watch_ssh_job(&store, status_of(&stored)?, target, dir, &run_id).await?;
+    watch_ssh_job(
+        &store,
+        status_of(&stored)?,
+        target,
+        dir,
+        descriptor.ssh_container,
+        &run_id,
+    )
+    .await?;
     Ok(())
 }
 
@@ -596,6 +606,7 @@ async fn watch_ssh_job(
     initial_status: RunStatus,
     target: ssh::SshTarget,
     dir: String,
+    container: Option<ssh::ContainerRun>,
     run_id: &str,
 ) -> Result<RunStatus> {
     let path = log_path(run_id);
@@ -610,9 +621,10 @@ async fn watch_ssh_job(
 
     let mut last_status = initial_status;
     let mut cancel_sent = false;
+    let mut last_message = None;
 
     loop {
-        let job = match ssh::inspect_job(&target, &dir).await {
+        let job = match ssh::inspect_job(&target, &dir, container.as_ref()).await {
             Ok(j) => j,
             Err(err) => {
                 eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
@@ -645,15 +657,32 @@ async fn watch_ssh_job(
             return Ok(status);
         }
 
+        if container.is_some() && job.message != last_message {
+            let message = format!(
+                "[orx] {}",
+                job.message.as_deref().unwrap_or("Container running.")
+            );
+            let command = format!(
+                "printf '%s\\n' {} >> \"$HOME/{dir}/log\"",
+                ssh::sh_quote(&message)
+            );
+            match ssh::ssh_run(&target, &command, None).await {
+                Ok(_) => last_message = job.message,
+                Err(error) => {
+                    eprintln!("supervise {run_id}: could not log container status: {error}")
+                }
+            }
+        }
+
         if status != last_status && store.update_status(run_id, status, None, None)? {
             let cancel_requested = local_cancel_requested(store, run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
             if cancel_requested && !cancel_sent {
-                cancel_ssh(&target, &dir, run_id, &mut cancel_sent).await;
+                cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
             }
         } else if !cancel_sent && local_cancel_requested(store, run_id) {
-            cancel_ssh(&target, &dir, run_id, &mut cancel_sent).await;
+            cancel_ssh(&target, &dir, container.as_ref(), run_id, &mut cancel_sent).await;
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -685,13 +714,24 @@ async fn tail_logs_ssh(
         }
     };
     let mut seen = 0u64;
+    let mut last_error = None;
     loop {
         let mut sink = |line: &str| {
             let _ = writeln!(log_file, "{line}");
         };
         match ssh::stream_logs(&target, &dir, seen, LOG_IDLE, &mut sink).await {
-            Ok(s) => seen = s,
-            Err(err) => eprintln!("supervise {run_id}: log stream error (will retry): {err}"),
+            Ok(s) => {
+                seen = s;
+                last_error = None;
+            }
+            // Retries every 2s through an outage; log each distinct failure once.
+            Err(err) => {
+                let err = err.to_string();
+                if last_error.as_ref() != Some(&err) {
+                    eprintln!("supervise {run_id}: log stream error (will retry): {err}");
+                    last_error = Some(err);
+                }
+            }
         }
         let _ = log_file.flush();
         if *done.borrow() {
@@ -701,9 +741,15 @@ async fn tail_logs_ssh(
     }
 }
 
-async fn cancel_ssh(target: &ssh::SshTarget, dir: &str, run_id: &str, cancel_sent: &mut bool) {
+async fn cancel_ssh(
+    target: &ssh::SshTarget,
+    dir: &str,
+    container: Option<&ssh::ContainerRun>,
+    run_id: &str,
+    cancel_sent: &mut bool,
+) {
     eprintln!("supervise {run_id}: cancel requested — killing remote process group");
-    match ssh::cancel_job(target, dir).await {
+    match ssh::cancel_job(target, dir, container).await {
         Ok(()) => *cancel_sent = true,
         Err(err) => eprintln!("supervise {run_id}: ssh cancel failed (will retry): {err}"),
     }
@@ -839,13 +885,15 @@ async fn run_openresearch(
                 teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
                 return Ok(());
             }
-            let staged = ssh::stage_source(&target, &run_id, &source.path, &source.digest).await;
+            let staged =
+                ssh::stage_source(&target, &run_id, &source.path, &source.digest, None).await;
             if let Err(err) = staged {
                 eprintln!("supervise {run_id}: source staging failed (will retry): {err}");
                 launch_err = Some(err);
                 continue;
             }
             match ssh::run_job(&ssh::SshJobSpec {
+                container: None,
                 target: target.clone(),
                 run_id: run_id.clone(),
                 script: script.clone(),
@@ -885,7 +933,7 @@ async fn run_openresearch(
     // The shared ssh loop owns status and logs; the box is deleted after
     // it returns (logs are drained from the box BEFORE teardown), and even
     // when it errors.
-    let watch = watch_ssh_job(&store, status_of(&stored)?, target, dir, &run_id).await;
+    let watch = watch_ssh_job(&store, status_of(&stored)?, target, dir, None, &run_id).await;
     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;
     watch?;
     Ok(())
@@ -1038,14 +1086,13 @@ fn cancel_local(dir: &std::path::Path, run_id: &str, cancel_sent: &mut bool) {
 // The ssh loop with a scheduler: state comes from the run dir's exit_code file
 // first, then squeue/sacct; cancel is `scancel`. Logs reuse `tail_logs_ssh` —
 // Slurm appends the job's output to the same `<run dir>/log` file the ssh
-// backend uses. A scancel'd job leaves the queue without an exit_code, which
-// inspect reports as CANCELED (or ERROR via the GONE fallback) — either way,
-// once cancel is sent the terminal state maps to `cancelled`.
+// backend uses. Accepted cancellation also finishes when the controller
+// confirms the job is absent, even without accounting or an exit_code.
 
 async fn run_slurm(
     store: Store,
     stored: crate::store::StoredRun,
-    descriptor: BackendDescriptor,
+    mut descriptor: BackendDescriptor,
     run_id: String,
 ) -> Result<()> {
     let (host, job_id) = descriptor.slurm_ref()?;
@@ -1066,39 +1113,57 @@ async fn run_slurm(
     ));
 
     let mut last_status = status_of(&stored)?;
-    let mut cancel_sent = false;
-    // "GONE" (scheduler doesn't know the job, no exit_code) must persist for
-    // a full minute before it's believed: it also fires during slurmctld
-    // restarts and while the exit_code write is NFS-lagged behind the compute
-    // node. Any other observation resets the count.
-    const GONE_POLLS_TO_FAIL: u32 = (60 / POLL_INTERVAL.as_secs()) as u32;
-    let mut gone_polls = 0u32;
+    let mut cancel_sent = descriptor.cancellation_accepted;
+    let mut failing_since = None;
+    let mut last_error = None;
 
     loop {
-        let mut job = match slurm::inspect_job(&host, &run_id, &job_id).await {
-            Ok(j) => j,
-            Err(err) => {
-                eprintln!("supervise {run_id}: inspect failed (will retry): {err}");
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            }
-        };
-        if job.stage == "GONE" {
-            gone_polls += 1;
-            if gone_polls < GONE_POLLS_TO_FAIL {
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            }
-            job = slurm::JobState {
-                stage: "ERROR".to_string(),
-                message: Some(
-                    "job left the queue without an exit code (killed or node lost?)".to_string(),
-                ),
-                exit_code: None,
-            };
-        } else {
-            gone_polls = 0;
+        if !cancel_sent && local_cancel_requested(&store, &run_id) {
+            cancel_slurm(&host, &job_id, &run_id, &mut cancel_sent).await;
         }
+        let mut observed = slurm::inspect_job(&host, &run_id, &job_id).await;
+        if let Ok(job) = &mut observed {
+            if cancel_sent && job.stage == "GONE" {
+                job.stage = "CANCELED".into();
+            }
+        }
+        let error = match &observed {
+            Err(err) => Some(format!("Monitoring unavailable: {err}. Reconnect with orx compute connect slurm --host {}. The job has not been declared stopped.", ssh::sh_quote(&host))),
+            Ok(job) if matches!(job.stage.as_str(), "GONE" | "UNAVAILABLE") => Some("Monitoring unavailable: no exit status or scheduler record. Check cluster/accounting availability; the job has not been declared stopped.".into()),
+            _ => None,
+        };
+        match (&error, &last_error) {
+            (Some(message), last) if last.as_ref() != Some(message) => {
+                eprintln!("supervise {run_id}: {message}");
+            }
+            (None, Some(_)) => eprintln!("supervise {run_id}: monitoring restored"),
+            _ => {}
+        }
+        last_error = error.clone();
+        failing_since = error
+            .as_ref()
+            .map(|_| failing_since.unwrap_or_else(std::time::Instant::now));
+        // Brief outages recover on their own; a restarted supervisor keeps an existing report.
+        let reported = error.clone().filter(|_| {
+            descriptor.monitoring_error.is_some()
+                || failing_since.is_some_and(|since| since.elapsed() >= MONITORING_GRACE)
+        });
+        if reported != descriptor.monitoring_error
+            || cancel_sent != descriptor.cancellation_accepted
+        {
+            let mut updated = descriptor.clone();
+            updated.monitoring_error = reported;
+            updated.cancellation_accepted = cancel_sent;
+            match store.set_backend_json(&run_id, &updated.to_json()) {
+                Ok(()) => descriptor = updated,
+                Err(err) => eprintln!("supervise {run_id}: could not save monitoring state: {err}"),
+            }
+        }
+        if error.is_some() {
+            tokio::time::sleep(POLL_INTERVAL).await;
+            continue;
+        }
+        let job = observed?;
         let stage = job.stage.as_str();
         let status = run_status_for_stage(&store, &run_id, cancel_sent, stage);
 
@@ -1125,14 +1190,8 @@ async fn run_slurm(
         }
 
         if status != last_status && store.update_status(&run_id, status, None, None)? {
-            let cancel_requested = local_cancel_requested(&store, &run_id);
             eprintln!("supervise {run_id}: {last_status} -> {status} (stage {stage})");
             last_status = status;
-            if cancel_requested && !cancel_sent {
-                cancel_slurm(&host, &job_id, &run_id, &mut cancel_sent).await;
-            }
-        } else if !cancel_sent && local_cancel_requested(&store, &run_id) {
-            cancel_slurm(&host, &job_id, &run_id, &mut cancel_sent).await;
         }
 
         tokio::time::sleep(POLL_INTERVAL).await;

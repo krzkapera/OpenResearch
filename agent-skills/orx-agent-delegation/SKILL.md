@@ -21,7 +21,8 @@ By default, this chat resumes with the helper's closing reply. Use `--no-wake`
 only when no follow-up is needed. A spawn chain may not go deeper than 4 levels
 below its root, and the CLI enforces the number of helpers a session may have
 in flight. If the command refuses a spawn for either reason, do the work here
-or wait for a helper to finish.
+or wait for a helper to finish. It also refuses a `--harness` that OpenResearch
+cannot find installed; spawn on this session's harness instead, or tell the user.
 
 ## Clean up after a helper
 

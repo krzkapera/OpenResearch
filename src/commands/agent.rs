@@ -60,7 +60,8 @@ pub async fn run(args: crate::AgentArgs) -> Result<()> {
                 plan_mode,
             },
             !no_wake,
-        ),
+        )
+        .await,
         AgentCommand::Kill { session_id } => kill(session_id).await,
     }
 }
@@ -167,7 +168,34 @@ struct SpawnSettings {
     plan_mode: bool,
 }
 
-fn spawn(
+/// Refuse a helper the resident `orx up` cannot launch: this command only queues
+/// it, so otherwise the caller hears "spawned" and the failure lands later.
+async fn ensure_installed(harness: &str) -> Result<()> {
+    // Any failure to ask falls back to queueing.
+    let Ok(Some(port)) = crate::local::chat::trusted_up_port() else {
+        return Ok(());
+    };
+    let Ok(install) = crate::commands::up::harness_install_via_up(port, harness).await else {
+        return Ok(());
+    };
+    match install_refusal(harness, &install) {
+        Some(refusal) => Err(anyhow!(refusal)),
+        None => Ok(()),
+    }
+}
+
+fn install_refusal(harness: &str, install: &crate::commands::up::HarnessInstall) -> Option<String> {
+    (!install.installed).then(|| {
+        format!(
+            "The OpenResearch server (the desktop app or `orx up`) cannot find {}, so no agent \
+             was spawned. Spawn on this session's own harness by omitting `--harness {harness}`, \
+             or ask the user to install it and restart OpenResearch.",
+            install.name
+        )
+    })
+}
+
+async fn spawn(
     store: &Store,
     task: Option<String>,
     stdin: bool,
@@ -202,6 +230,10 @@ fn spawn(
     if !crate::local::harness::is_chat_harness(&harness) {
         return Err(anyhow!("unknown harness: {harness}"));
     }
+    // The parent is already running on its own harness, so only a switch needs checking.
+    if harness != parent.harness {
+        ensure_installed(&harness).await?;
+    }
     let nonempty = |value: Option<String>| value.filter(|item| !item.trim().is_empty());
     let permission_mode = nonempty(permission_mode);
     let reasoning_level = nonempty(reasoning_level);
@@ -225,6 +257,10 @@ fn spawn(
     // permission-mode id from one CLI is meaningless to another. An explicit
     // flag always wins over both the parent and the harness default.
     let inherits = harness == parent.harness;
+    // The parent is already running on its own harness, so only a switch needs checking.
+    if !inherits {
+        ensure_installed(&harness).await?;
+    }
     let changes_model = model
         .as_deref()
         .is_some_and(|model| parent.model.as_deref() != Some(model));
@@ -263,6 +299,7 @@ fn spawn(
         archived: false,
         context_usage_json: None,
         bootstrap_context: None,
+        goal: None,
         active_leaf_id: None,
         parent_session_id: Some(parent_id.clone()),
         auto_resume: false,
@@ -329,8 +366,10 @@ async fn kill(session_id: String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_spawn_ancestor, spawn_depth, spawn_refusal, task_text, MAX_LIVE_SPAWNS, MAX_SPAWN_DEPTH,
+        install_refusal, is_spawn_ancestor, spawn_depth, spawn_refusal, task_text,
+        MAX_LIVE_SPAWNS, MAX_SPAWN_DEPTH,
     };
+    use crate::commands::up::HarnessInstall;
     use crate::store::{Store, StoredChatSession};
 
     fn session(id: &str, parent_session_id: Option<&str>) -> StoredChatSession {
@@ -350,6 +389,7 @@ mod tests {
             archived: false,
             context_usage_json: None,
             bootstrap_context: None,
+            goal: None,
             active_leaf_id: None,
             parent_session_id: parent_session_id.map(str::to_string),
             auto_resume: false,
@@ -445,5 +485,17 @@ mod tests {
         assert!(task_text(Some("   ".into()), false).is_err());
         // --stdin and a positional together are ambiguous, so neither is used.
         assert!(task_text(Some("from the args".into()), true).is_err());
+    }
+
+    #[test]
+    fn install_refusal_only_for_a_missing_harness() {
+        let info = |installed| HarnessInstall {
+            name: "Codex".into(),
+            installed,
+        };
+        assert_eq!(install_refusal("codex", &info(true)), None);
+        let missing = install_refusal("codex", &info(false)).unwrap();
+        assert!(missing.contains("cannot find Codex"), "{missing}");
+        assert!(missing.contains("`--harness codex`"), "{missing}");
     }
 }

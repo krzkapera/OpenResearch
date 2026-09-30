@@ -39,6 +39,12 @@ export function isTurnStatusPart(part: ChatPart): boolean {
   return part.id === "turn-retry" || part.id === "turn-recovery";
 }
 
+export function withoutDuplicateTurnError(parts: ChatPart[], turnStatus: ChatPart | undefined): ChatPart[] {
+  const last = parts.at(-1);
+  return turnStatus?.id === "turn-recovery" && last?.type === "tool" && last.tool === "error"
+    && last.state?.error && last.state.error === turnStatus.state?.error ? parts.slice(0, -1) : parts;
+}
+
 /** The last visible part, when it is a non-errored tool. */
 export function partsTailToolId(parts: ChatPart[]): string | null {
   for (let index = parts.length - 1; index >= 0; index--) {
@@ -100,6 +106,53 @@ export function splitTurnParts(parts: ChatPart[], streaming: boolean): { work: C
   return finalIndex < 0 || (!streaming && !parts.slice(finalIndex).some((part) => partIsVisible(part))) || !parts.slice(0, finalIndex).some((part) => partIsVisible(part))
     ? { work: [], answer: parts }
     : { work: parts.slice(0, finalIndex), answer: parts.slice(finalIndex) };
+}
+
+function textPartsText(parts: ChatPart[]): string {
+  return parts
+    .flatMap((part) => {
+      const text = part.type === "text" ? part.text?.trim() : undefined;
+      return text ? [text] : [];
+    })
+    .join("\n\n");
+}
+
+/** The answer an assistant turn gave, without its commentary or tool work. */
+export function responseText(message: ChatMessage): string {
+  return textPartsText(splitTurnParts(message.parts, false).answer);
+}
+
+export function lastResponseText(messages: ChatMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (messages[index].role !== "assistant") continue;
+    const text = responseText(messages[index]);
+    if (text) return text;
+  }
+  return "";
+}
+
+/** `null` when the chat has no text to export yet. */
+export function transcriptMarkdown(
+  title: string,
+  messages: ChatMessage[],
+  labels: { user: string; assistant: string },
+): string | null {
+  const sections = messages.flatMap((message) => {
+    const text = textPartsText(message.parts);
+    if (!text) return [];
+    return [`## ${message.role === "user" ? labels.user : labels.assistant}\n\n${text}`];
+  });
+  if (sections.length === 0) return null;
+  return [`# ${title}`, ...sections].join("\n\n") + "\n";
+}
+
+export function transcriptFileName(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .slice(0, 80)
+    .replace(/^-+|-+$/g, "");
+  return `${slug || "chat"}.md`;
 }
 
 export function isModelAccessLimitPart(part: ChatPart): boolean {

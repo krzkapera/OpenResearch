@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-use super::detect::{probe_bin, resolve_symlinks, HarnessAuthState, HarnessInfo, ModelInfo};
+use super::detect::{resolve_symlinks, HarnessAuthState, HarnessInfo, ModelInfo};
 use super::options::{
     HarnessOptions, OptionChoice, PermissionMode, PlanActivation, REASONING_DEFAULT_ID,
 };
@@ -43,36 +43,30 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Antigravity;
 
-#[async_trait]
-impl Harness for Antigravity {
-    fn id(&self) -> &'static str {
-        "antigravity"
-    }
-
-    fn name(&self) -> &'static str {
-        "Google Antigravity"
-    }
-
-    fn supports_chat(&self) -> bool {
-        true
-    }
-
-    fn supports_five_hour_quota_probe(&self) -> bool {
-        true
-    }
-
-    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
-        probe_agy_five_hour_quota().await
-    }
-
-    async fn detect(&self) -> Option<HarnessInfo> {
+impl Antigravity {
+    /// `snapshot` reports discovery only: `agy`'s auth *is* the model list,
+    /// so a child-free pass marks the install pending and leaves readiness to
+    /// the background full pass.
+    async fn detect_at(&self, snapshot: bool) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
-        if let Some(bin) = find_agy() {
-            info.record_bin(&bin, probe_bin(&bin).await);
+        super::detect::record_selected(
+            &mut info,
+            snapshot,
+            "antigravity",
+            find_agy,
+            find_agy_working(),
+        )
+        .await;
+        // Nothing else about an installed agy is cheap to verify — `detect_one`
+        // marks the snapshot answer pending. A missing install still falls
+        // through to pick up its note.
+        if snapshot && info.installed {
+            return Some(info);
         }
         if info.installed && !info.install_broken {
             if let Some(bin) = info.bin_path.as_deref().map(Path::new) {
-                match agy_model_list(bin).await {
+                match super::detect::timed_probe("antigravity", "models", agy_model_list(bin)).await
+                {
                     Ok(models) => {
                         info.authenticated = true;
                         info.auth_state = HarnessAuthState::Ready;
@@ -109,6 +103,37 @@ impl Harness for Antigravity {
         }
         Some(info)
     }
+}
+
+#[async_trait]
+impl Harness for Antigravity {
+    fn id(&self) -> &'static str {
+        "antigravity"
+    }
+
+    fn name(&self) -> &'static str {
+        "Google Antigravity"
+    }
+
+    fn supports_chat(&self) -> bool {
+        true
+    }
+
+    fn supports_five_hour_quota_probe(&self) -> bool {
+        true
+    }
+
+    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
+        probe_agy_five_hour_quota().await
+    }
+
+    async fn detect(&self) -> Option<HarnessInfo> {
+        self.detect_at(false).await
+    }
+
+    async fn detect_snapshot(&self) -> Option<HarnessInfo> {
+        self.detect_at(true).await
+    }
 
     async fn run_turn(&self, ctx: &mut TurnCtx) -> TurnResult {
         run_turn(ctx)
@@ -120,21 +145,21 @@ impl Harness for Antigravity {
     fn options(&self) -> HarnessOptions {
         HarnessOptions::none()
             .with_permission_choices(
-                vec![
-                    OptionChoice::described(
-                        "default",
-                        "Ask for approval",
-                        "Ask before changes; allow read-only planning",
-                    ),
-                    OptionChoice::described(
-                        "bypass",
-                        "Bypass permissions",
-                        "Allow commands and skip tool confirmation prompts",
-                    ),
-                ],
-                "default",
-                PlanActivation::Command,
-            )
+            vec![
+                OptionChoice::described(
+                    "default",
+                    "Ask for approval",
+                    "Ask before changes; allow read-only planning",
+                ),
+                OptionChoice::described(
+                    "bypass",
+                    "Bypass permissions",
+                    "Allow commands and skip tool confirmation prompts",
+                ),
+            ],
+            "bypass",
+            PlanActivation::Command,
+        )
             .with_reasoning_levels(&["low", "medium", "high"])
     }
 
@@ -206,20 +231,36 @@ impl Harness for Antigravity {
     }
 }
 
-/// `agy` on PATH, else search common install locations under `~/.local/bin`
-/// `~/.gemini/bin`, or `~/.gemini/antigravity-cli/bin`.
-pub(crate) fn find_agy() -> Option<PathBuf> {
+/// `agy` on PATH, then common install locations under `~/.local/bin`,
+/// `~/.gemini/bin`, or `~/.gemini/antigravity-cli/bin`, in preference order.
+fn agy_candidates() -> Vec<PathBuf> {
+    let home_dirs = dirs::home_dir().into_iter().flat_map(|home| {
+        let gemini = home.join(".gemini");
+        [
+            home.join(".local").join("bin"),
+            gemini.join("bin"),
+            gemini.join("antigravity-cli").join("bin"),
+        ]
+    });
+    let drops = home_dirs
+        .chain(dirs::data_local_dir().map(|dir| dir.join("agy").join("bin")))
+        .filter_map(|dir| find_in_dir(&dir, "agy"));
     find_on_path("agy")
-        .or_else(|| {
-            let home = dirs::home_dir()?;
-            let local = home.join(".local").join("bin");
-            let gemini = home.join(".gemini");
-            find_in_dir(&local, "agy")
-                .or_else(|| find_in_dir(&gemini.join("bin"), "agy"))
-                .or_else(|| find_in_dir(&gemini.join("antigravity-cli").join("bin"), "agy"))
-        })
-        .or_else(|| find_in_dir(&dirs::data_local_dir()?.join("agy").join("bin"), "agy"))
+        .into_iter()
+        .chain(drops)
         .map(resolve_symlinks)
+        .collect()
+}
+
+/// The executable detection selected, else the first candidate — sync callers
+/// cannot probe, and must not spawn a launcher detection already skipped.
+pub(crate) fn find_agy() -> Option<PathBuf> {
+    super::detect::selected_bin("antigravity", agy_candidates())
+}
+
+/// The first candidate that actually runs, with its version probe.
+pub(super) async fn find_agy_working() -> Option<(PathBuf, super::detect::BinProbe)> {
+    super::detect::select_working("antigravity", agy_candidates(), None).await
 }
 
 async fn agy_model_list(bin: &Path) -> Result<Vec<ModelInfo>> {
@@ -231,9 +272,9 @@ async fn agy_model_list(bin: &Path) -> Result<Vec<ModelInfo>> {
         .kill_on_drop(true);
     prepare_env(&mut cmd);
     cmd.env("NO_COLOR", "1");
-    let out = tokio::time::timeout(MODELS_TIMEOUT, cmd.output())
+    let out = super::detect::detect_spawn_output_timed(cmd, MODELS_TIMEOUT)
         .await
-        .map_err(|_| {
+        .ok_or_else(|| {
             anyhow!("Antigravity model discovery timed out. Re-check when connected.")
         })??;
     if !out.status.success() {
@@ -400,7 +441,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
         .host
         .up_port()
         .ok_or_else(|| anyhow!("Antigravity requires the OpenResearch approval bridge"))?;
-    write_approval_hook(&repo)?;
+    let bypass = ctx.permission_mode.unwrap_or(PermissionMode::Bypass) == PermissionMode::Bypass;
+    let hook_enabled = !bypass || ctx.plan_mode;
+    write_approval_hook(&repo, hook_enabled)?;
     let resume = ctx.native_session_id.clone();
     let mut prompt = ctx.text.clone();
     if resume.is_none() {
@@ -453,11 +496,12 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     cmd.env("ORX_SESSION_ID", &ctx.session_id);
     cmd.env(
         "ORX_GATE_TOKEN",
-        ctx.host.mint_gate_token(&ctx.session_id, ctx.plan_mode),
+        ctx.host
+            .mint_gate_token(&ctx.session_id, ctx.plan_mode, bypass),
     );
     cmd.env(
         "ORX_AGY_GATE",
-        if ctx.permission_mode == Some(PermissionMode::Bypass) && !ctx.plan_mode {
+        if bypass && !ctx.plan_mode {
             "bypass"
         } else {
             "ask"
@@ -566,7 +610,7 @@ fn stop_turn_process(pid: u32) {
     let snapshot = std::process::Command::new("ps")
         .args(["-ww", "-axo", "pid=,ppid=,args="])
         .output();
-    let supervisor_exe = std::env::current_exe().ok();
+    let supervisor_exe = crate::paths::spawnable_exe().ok();
     match snapshot {
         Ok(output) if output.status.success() => {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
@@ -628,7 +672,8 @@ Stop-TurnProcess ([uint32] $env:ORX_STOP_PID)
     }
 }
 
-fn write_approval_hook(repo: &Path) -> Result<()> {
+fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
+    std::fs::create_dir_all(repo)?;
     let tracked = std::process::Command::new("git")
         .args(["ls-files", "--error-unmatch", ".agents/hooks.json"])
         .current_dir(repo)
@@ -647,7 +692,7 @@ fn write_approval_hook(repo: &Path) -> Result<()> {
     let object = hooks
         .as_object_mut()
         .ok_or_else(|| anyhow!("Antigravity hooks must be an object"))?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::paths::spawnable_exe()?;
     #[cfg(not(windows))]
     let command = format!(
         "{} antigravity-gate",
@@ -656,16 +701,28 @@ fn write_approval_hook(repo: &Path) -> Result<()> {
     #[cfg(windows)]
     let command = {
         anyhow::ensure!(
-            exe.file_name()
-                .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("orx.exe")),
+            cfg!(test)
+                || exe
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("orx.exe")),
             "The Antigravity approval bridge requires the executable name orx.exe"
         );
         // prepare_env puts this executable's directory first on PATH.
         "orx antigravity-gate".to_string()
     };
-    object.insert("openresearch-approval".into(), serde_json::json!({
-        "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
-    }));
+    object.insert(
+        "openresearch-approval".into(),
+        serde_json::json!({
+            "enabled": enabled,
+            "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
+        }),
+    );
+    object.insert(
+        "openresearch-accounting".into(),
+        serde_json::json!({
+            "enabled": true, "PostInvocation": [{"type":"command","command":command}]
+        }),
+    );
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(path, serde_json::to_vec_pretty(&hooks)?)?;
     Ok(())
@@ -754,6 +811,22 @@ struct TurnState {
     turn_errored: bool,
 }
 
+pub(crate) fn invocation_sample_id(conversation: &str, step: i64) -> String {
+    format!("antigravity:{conversation}:step:{step}")
+}
+
+fn antigravity_step_usage(step: &Value) -> Option<crate::store::TokenUsage> {
+    let usage = step.get("usage")?;
+    let field = |key| usage.get(key).and_then(Value::as_u64);
+    Some(crate::store::TokenUsage {
+        input_tokens: field("input_tokens"),
+        output_tokens: field("output_tokens"),
+        cache_read_tokens: field("cache_read_tokens"),
+        cache_write_tokens: None,
+        reasoning_tokens: field("thinking_tokens"),
+    })
+}
+
 fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool {
     let event_type = event.get("event").and_then(Value::as_str).unwrap_or("");
     match event_type {
@@ -775,6 +848,19 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
                     .filter(|id| !id.is_empty())
                 {
                     state.conversation_id = Some(cid.to_string());
+                }
+                if let (Some(index), Some(usage)) = (
+                    step.get("step_index").and_then(Value::as_i64),
+                    antigravity_step_usage(step),
+                ) {
+                    let sample_id = state
+                        .conversation_id
+                        .as_deref()
+                        .map(|conversation| invocation_sample_id(conversation, index))
+                        .unwrap_or_else(|| {
+                            format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
+                        });
+                    ctx.record_native_usage(&sample_id, None, None, usage);
                 }
                 let step_type = step.get("step_type").and_then(Value::as_str).unwrap_or("");
                 let step_state = step.get("state").and_then(Value::as_str).unwrap_or("");
@@ -925,6 +1011,18 @@ fn plan_card(parts: &[WirePart], assistant_id: &str) -> Option<WirePart> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_step_usage_includes_reasoning_without_double_counting() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/antigravity-usage.json")).unwrap();
+        let usage = super::antigravity_step_usage(&fixture[0]["step_update"]).unwrap();
+        usage.validate().unwrap();
+        assert_eq!(usage.total(), Some(13155));
+        assert_eq!(usage.reasoning_tokens, Some(138));
+        assert_eq!(usage.cache_write_tokens, None);
+        assert!(super::antigravity_step_usage(&serde_json::json!({})).is_none());
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -1187,11 +1285,36 @@ mod tests {
             .status()
             .unwrap()
             .success());
-        assert!(write_approval_hook(&repo)
+        assert!(write_approval_hook(&repo, true)
             .unwrap_err()
             .to_string()
             .contains("tracks .agents/hooks.json"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "{}");
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn approval_hook_respects_enabled_flag() {
+        let repo =
+            std::env::temp_dir().join(format!("orx-agy-hooks-flag-{}", uuid::Uuid::new_v4()));
+        write_approval_hook(&repo, false).unwrap();
+        let path = repo.join(".agents/hooks.json");
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(content["openresearch-approval"]["enabled"], false);
+        assert_eq!(content["openresearch-accounting"]["enabled"], true);
+        assert_eq!(
+            content["openresearch-accounting"]["PostInvocation"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        write_approval_hook(&repo, true).unwrap();
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(content["openresearch-approval"]["enabled"], true);
         std::fs::remove_dir_all(repo).unwrap();
     }
 

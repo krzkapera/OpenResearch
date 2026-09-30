@@ -25,9 +25,10 @@ use crate::store;
 
 #[path = "opencode_runtime.rs"]
 mod runtime;
+#[cfg(all(test, unix))]
+pub(crate) use runtime::resolve_binary_at;
 pub(crate) use runtime::{
-    prepare_database, resolve_binary, resolve_binary_at, start_server, AgentEndpoint, Protocol,
-    ResolvedBinary,
+    prepare_database, resolve_binary, start_server, AgentEndpoint, Protocol, ResolvedBinary,
 };
 
 /// Playbook path inside the session worktree; opencode re-reads it every turn,
@@ -42,21 +43,37 @@ pub(crate) struct ResolvedRuntime {
     pub store: NativeStore,
 }
 
-/// `opencode` on PATH, else the installer's default drop location.
-pub fn find_opencode() -> Result<PathBuf> {
-    if let Some(found) = crate::local::shell_env::find_on_path("opencode") {
-        return Ok(found);
-    }
-    if let Some(home) = dirs::home_dir() {
-        let dir = home.join(".opencode").join("bin");
-        if let Some(found) = crate::local::shell_env::find_in_dir(&dir, "opencode") {
-            return Ok(found);
-        }
-    }
-    Err(anyhow!(
+/// `opencode` on PATH, then the installer's default drop location, in
+/// preference order. The native installer writes `~/.opencode/bin`, which a
+/// stale npm-style `opencode` shim earlier on PATH otherwise hides.
+pub(crate) fn opencode_candidates() -> Vec<PathBuf> {
+    let drop = dirs::home_dir()
+        .map(|home| home.join(".opencode").join("bin"))
+        .and_then(|dir| crate::local::shell_env::find_in_dir(&dir, "opencode"));
+    // Resolved and de-duplicated: the native install is both on PATH and in its
+    // drop directory, and probing that one binary twice costs a 15s timeout.
+    crate::local::harness::unique_bins(
+        crate::local::shell_env::find_on_path("opencode")
+            .into_iter()
+            .chain(drop)
+            .map(|path| crate::paths::canonicalize(&path).unwrap_or(path))
+            .collect(),
+    )
+}
+
+pub(crate) fn not_found() -> crate::error::Error {
+    anyhow!(
         "opencode not found (checked PATH and ~/.opencode/bin/opencode).\n\
          Install it with: curl -fsSL https://opencode.ai/install | bash"
-    ))
+    )
+}
+
+/// `opencode` on PATH, else the installer's default drop location.
+pub fn find_opencode() -> Result<PathBuf> {
+    opencode_candidates()
+        .into_iter()
+        .next()
+        .ok_or_else(not_found)
 }
 
 /// Ask the OS for a free loopback port (bind :0, read it back, release).
@@ -76,7 +93,7 @@ pub fn agent_log_path() -> PathBuf {
 /// is denied AND disabled (it would deadlock serve mode — nothing can answer
 /// it), repeated on the default `build` agent because the tool filter is
 /// agent-scoped. The model default keeps local subagents on the same endpoint.
-fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
+fn opencode_config_json(model: Option<&str>, instructions: &str, plugin: Option<&str>) -> String {
     let mut cfg = json!({
         "$schema": "https://opencode.ai/config.json",
         "permission": {
@@ -100,6 +117,9 @@ fn opencode_config_json(model: Option<&str>, instructions: &str) -> String {
         },
         "instructions": [instructions],
     });
+    if let Some(plugin) = plugin {
+        cfg["plugin"] = json!([plugin]);
+    }
     if let Some(model) = model {
         cfg["model"] = json!(model);
     }
@@ -217,12 +237,12 @@ fn playbook_md(project: &LocalProject, state: &ProjectState) -> String {
         .map_or(String::new(), |flavor| format!(" (`--flavor {flavor}`)"));
     let compute_bullet = format!(
         "- Compute: default target **{compute_backend}**{flavor_part} — \
-         {compute_default_source}; load **`orx-compute`** before launching"
+         {compute_default_source}; load **`orx-compute`** and read `orx compute instructions show` before configuring or launching"
     );
     let project_state = project_state_md(project, state);
     let skill_names = super::agent_skills::skills(super::agent_skills::SkillSet::Local)
         .iter()
-        .map(|skill| format!("- `{}`", skill.name))
+        .map(|skill| format!("- `{}`: {}", skill.name, skill.description))
         .collect::<Vec<_>>()
         .join("\n");
     let template = SYSTEM_PROMPT
@@ -335,11 +355,23 @@ fn write_agent_files(
     project: &LocalProject,
     model: Option<&str>,
     session_id: &str,
+    protocol: Protocol,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
     // Source of truth for the session-skills dir is the harness trait.
     use crate::local::harness::Harness;
     let skills_dir = crate::local::harness::opencode::OpenCode.session_skills_dir();
     let (repo, playbook) = ensure_playbook(project, session_id, skills_dir)?;
+    let plugin = if protocol == Protocol::V1 {
+        let path = repo.join(".openresearch/agent/invocation.mjs");
+        std::fs::write(&path, include_str!("opencode_invocation.mjs"))?;
+        Some(
+            reqwest::Url::from_file_path(&path)
+                .map_err(|_| anyhow!("Invalid invocation plugin path"))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     let config_override = if git::is_tracked(&repo, "opencode.json") {
         // Out-of-root config: absolute instructions path (no root to anchor it).
         let path = repo
@@ -348,14 +380,14 @@ fn write_agent_files(
             .join("opencode.json");
         std::fs::write(
             &path,
-            opencode_config_json(model, &playbook.to_string_lossy()),
+            opencode_config_json(model, &playbook.to_string_lossy(), plugin.as_deref()),
         )
         .map_err(|e| anyhow!("Could not write {}: {}", path.display(), e))?;
         Some(path)
     } else {
         std::fs::write(
             repo.join("opencode.json"),
-            opencode_config_json(model, PLAYBOOK_REL),
+            opencode_config_json(model, PLAYBOOK_REL, plugin.as_deref()),
         )
         .map_err(|e| anyhow!("Could not write opencode.json: {}", e))?;
         None
@@ -420,9 +452,12 @@ async fn spawn_agent(
     let (repo, config_override) = {
         let (project, model) = (project.clone(), model.map(str::to_string));
         let session = session_id.to_string();
-        tokio::task::spawn_blocking(move || write_agent_files(&project, model.as_deref(), &session))
-            .await
-            .map_err(|e| anyhow!("agent file task failed: {e}"))??
+        let protocol = binary.protocol;
+        tokio::task::spawn_blocking(move || {
+            write_agent_files(&project, model.as_deref(), &session, protocol)
+        })
+        .await
+        .map_err(|e| anyhow!("agent file task failed: {e}"))??
     };
     // Best-effort: the playbook is the real guide; the shim just lets
     // opencode's skill tool surface `orx skill` too.
@@ -461,6 +496,13 @@ async fn spawn_agent(
         endpoint,
         database,
     })
+}
+
+/// Why a summarize attempt did or did not compact in place.
+pub(crate) enum SummarizeOutcome {
+    Compacted,
+    NoServer,
+    NoModel,
 }
 
 /// The `orx up` opencode host: one serve child per chat session, keyed by the
@@ -543,6 +585,37 @@ impl AgentHost {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// Ask opencode to summarize (compact) a session in place.
+    pub(crate) async fn summarize(
+        &self,
+        session_id: &str,
+        native_id: &str,
+        model: Option<&str>,
+    ) -> Result<SummarizeOutcome> {
+        let Some(endpoint) = self.endpoint_for(session_id).await else {
+            return Ok(SummarizeOutcome::NoServer);
+        };
+        // Summarize needs a named model. A session can legitimately have none
+        // (a custom provider advertises no models), and there is no way to call
+        // this endpoint without one — so the caller knowingly trades this
+        // resumable session for a summary rather than leaving `/compact` broken.
+        let Some((provider, model_id)) = model.and_then(|model| model.split_once('/')) else {
+            return Ok(SummarizeOutcome::NoModel);
+        };
+        let path = match endpoint.protocol {
+            Protocol::V1 => format!("/session/{native_id}/summarize"),
+            Protocol::V2 => format!("/api/session/{native_id}/summarize"),
+        };
+        endpoint
+            .client
+            .post(format!("{}{path}", endpoint.base_url))
+            .json(&json!({ "providerID": provider, "modelID": model_id }))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(SummarizeOutcome::Compacted)
     }
 
     /// Spawn (or reuse) the opencode server for this session. Idempotent when
@@ -776,14 +849,12 @@ mod tests {
             "template comment not stripped"
         );
         assert!(!md.contains("<!--"), "HTML comment leaked into the prompt");
-        // Sanity: skill routing names every installed native skill without
-        // duplicating the descriptions already surfaced by the harness.
         assert!(md.contains("Use the available OpenResearch skills"));
         assert!(md.contains("execute important user flows"));
         assert!(!md.contains("orx skill <name>"));
+        // Native catalogs may abbreviate descriptions; preserve routing context here.
         for skill in agent_skills::skills(SkillSet::Local) {
-            assert!(md.contains(&format!("- `{}`", skill.name)));
-            assert!(!md.contains(skill.description));
+            assert!(md.contains(&format!("- `{}`: {}", skill.name, skill.description)));
         }
         assert!(md.contains("orx-compute"));
         assert!(md.contains("helping the user across the research process"));

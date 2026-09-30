@@ -7,9 +7,22 @@ import {
   partsTailToolId,
   streamTailIsText,
   streamTailTool,
+  lastResponseText,
+  transcriptFileName,
+  transcriptMarkdown,
+  withoutDuplicateTurnError,
 } from "../src/chatRendering.ts";
 
 const message = (...parts) => ({ id: "assistant", role: "assistant", parts, createdAt: 0 });
+
+test("a recovery error replaces the identical terminal error without hiding other errors", () => {
+  const duplicate = { id: "err-0", type: "tool", tool: "error", state: { error: "Invalid model" } };
+  const other = { id: "err-1", type: "tool", tool: "error", state: { error: "Other failure" } };
+  const recovery = { id: "turn-recovery", type: "tool", tool: "error", state: { error: "Invalid model" } };
+  assert.deepEqual(withoutDuplicateTurnError([other, duplicate], recovery), [other]);
+  assert.deepEqual(withoutDuplicateTurnError([duplicate, other], recovery), [duplicate, other]);
+  assert.deepEqual(withoutDuplicateTurnError([duplicate], undefined), [duplicate]);
+});
 
 test("invisible transcript parts do not displace a visible tool tail", () => {
   const tool = { id: "tool", type: "tool", state: { status: "completed" } };
@@ -144,4 +157,68 @@ test("live OpenCode questions route composer text to the existing prompt", () =>
   }
   assert.equal(pendingQuestionId([message({ ...question, prompt: { ...question.prompt, resolved: true } })], "opencode", true), null);
   assert.equal(pendingQuestionId([message(question)], "cursor", true), null);
+});
+
+const user = (id, text) => ({ id, role: "user", createdAt: 0, parts: [{ id: `${id}-t`, type: "text", text }] });
+const assistant = (id, parts) => ({ id, role: "assistant", createdAt: 0, parts });
+
+test("copy takes the latest answer, skipping commentary and tool work", () => {
+  const messages = [
+    user("u1", "first"),
+    assistant("a1", [{ id: "t1", type: "text", text: "old answer", phase: "final_answer" }]),
+    user("u2", "second"),
+    assistant("a2", [
+      { id: "c", type: "text", text: "checking files", phase: "commentary" },
+      { id: "tool", type: "tool", tool: "read" },
+      { id: "f", type: "text", text: "new answer", phase: "final_answer" },
+    ]),
+  ];
+  assert.equal(lastResponseText(messages), "new answer");
+});
+
+test("copy falls back to an earlier turn when the latest has no answer", () => {
+  const messages = [
+    assistant("a1", [{ id: "t1", type: "text", text: "kept", phase: "final_answer" }]),
+    assistant("a2", [{ id: "tool", type: "tool", tool: "bash" }]),
+  ];
+  assert.equal(lastResponseText(messages), "kept");
+  assert.equal(lastResponseText([user("u", "only a question")]), "");
+});
+
+test("export keeps commentary that copy leaves out", () => {
+  const messages = [
+    user("u1", "run it"),
+    assistant("a1", [
+      { id: "c", type: "text", text: "checking files", phase: "commentary" },
+      { id: "f", type: "text", text: "done", phase: "final_answer" },
+    ]),
+  ];
+  assert.equal(lastResponseText(messages), "done");
+  assert.match(
+    transcriptMarkdown("T", messages, { user: "You", assistant: "Codex" }),
+    /checking files\n\ndone/,
+  );
+});
+
+test("export writes each speaker's text under a heading", () => {
+  const markdown = transcriptMarkdown(
+    "Sweep",
+    [
+      user("u1", "run it"),
+      assistant("a1", [
+        { id: "r", type: "reasoning", text: "hidden" },
+        { id: "t", type: "text", text: "done" },
+      ]),
+    ],
+    { user: "You", assistant: "Codex" },
+  );
+  assert.equal(markdown, "# Sweep\n\n## You\n\nrun it\n\n## Codex\n\ndone\n");
+  assert.equal(transcriptMarkdown("Empty", [assistant("a", [{ id: "x", type: "tool" }])], { user: "You", assistant: "Codex" }), null);
+});
+
+test("export file names are safe slugs", () => {
+  assert.equal(transcriptFileName("LR sweep: v2 / final?"), "lr-sweep-v2-final.md");
+  assert.equal(transcriptFileName("???"), "chat.md");
+  // Trimmed after the cut, so a title severed at a separator keeps a clean name.
+  assert.equal(transcriptFileName(`${"a".repeat(79)} tail`), `${"a".repeat(79)}.md`);
 });

@@ -17,6 +17,7 @@ import {
 
 import { listChatSessionsQuery, getChatMessagesQuery } from "./queries/chat";
 import { listProjectsQuery, getUiStateQuery, listRunsQuery, listExperimentsQuery } from "./queries/projects";
+import { setExperimentArchived } from "./api";
 import { getArtifactsQuery } from "./queries/files";
 import { useBlocker, useRouter, useRouterState } from "@tanstack/react-router";
 import {
@@ -97,6 +98,7 @@ import {
 } from "./api";
 import { WorkspaceTools } from "./components/WorkspaceTools";
 import { ProjectTerminal } from "./components/ProjectTerminal";
+import { isWindowsDrivePath } from "./markdownTarget";
 import { ChatPanel, findPartById, spawnRowTitle } from "./components/ChatPanel";
 import { usePopover } from "./components/ModelPicker";
 import { SubagentTab } from "./components/SubagentTab";
@@ -113,6 +115,7 @@ import { UpdateBanner, useUpdateStatus } from "./components/UpdateBanner";
 import { OfflineBanner } from "./components/OfflineBanner";
 import { NewProjectDialog } from "./components/ProjectsHome";
 import { ExperimentsTable } from "./components/ExperimentsTable";
+import { archiveActionsByExperiment } from "./components/ArchiveMenu";
 import { Md } from "./components/Md";
 import { SettingsView, type SettingsTab } from "./components/SettingsPage";
 import { DemoWelcomeModal } from "./components/Tour";
@@ -162,7 +165,7 @@ function parseFilePath(
   }
   // A home-anchored path (`~` or `~/…`) is disk, never a repo file — the backend
   // expands the `~`, so hand it over verbatim.
-  if (path === "~" || path.startsWith("~/")) return { path, source: "abs" };
+  if (path === "~" || path.startsWith("~/") || isWindowsDrivePath(path)) return { path, source: "abs" };
   // `path` relative to `base` (`""` when equal), else null. macOS symlinks
   // `/tmp`→`/private/tmp` and `/var`→`/private/var`, so an agent-inlined path
   // and the stored dir can differ only by that prefix — strip it on both sides.
@@ -260,8 +263,11 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const selectedRunId = pane?.kind === "experiment" ? pane.runId ?? null : null;
   const [consumedLine, setConsumedLine] = useState<number | null>(null);
   const [lineJump, setLineJump] = useState(0);
-  const lineVisit = useRef({ href: "", jump: 0, value: 0 });
-  if (lineVisit.current.href !== location.href || lineVisit.current.jump !== lineJump) lineVisit.current = { href: location.href, jump: lineJump, value: lineVisit.current.value + 1 };
+  // The href and the jump bump can both land before the pane carrying the new
+  // line, so keying on them alone spends the request on the previous line.
+  const visitKey = `${location.href}\n${JSON.stringify(pane ?? null)}\n${lineJump}`;
+  const lineVisit = useRef({ key: "", value: 0 });
+  if (lineVisit.current.key !== visitKey) lineVisit.current = { key: visitKey, value: lineVisit.current.value + 1 };
   const rightTab = useMemo<RightTab>(() => {
     const tab = pane ? paneTab(pane) : "experiments";
     return typeof tab === "object" && "path" in tab && tab.line && consumedLine !== lineVisit.current.value
@@ -354,6 +360,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const artifacts = artifactsQuery.data ?? null;
 
   const [view, setView] = useState<ExperimentsView>("table");
+  const [showArchivedExperiments, setShowArchivedExperiments] = useState(false);
   // Experiments pane scope: "agent" narrows to the open chat session's work.
   // Falls back to "project" whenever there is no usable experiment attribution.
   const [scope, setScope] = useState<"agent" | "project">("project");
@@ -367,6 +374,22 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     if (effectiveScope !== "agent") return experiments;
     return experiments.filter((experiment) => experiment.chatSessionId === activeSessionId);
   }, [experiments, effectiveScope, activeSessionId]);
+  const visibleScopedExperiments = useMemo(
+    () => scopedExperiments.filter((experiment) => showArchivedExperiments || !experiment.archived),
+    [scopedExperiments, showArchivedExperiments],
+  );
+  const archiveActions = useMemo(() => archiveActionsByExperiment(experiments), [experiments]);
+  const archiveExperiment = useCallback(async (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) => {
+    try {
+      await setExperimentArchived(id, direction, archived);
+      await queryClient.invalidateQueries({ queryKey: listExperimentsQuery(projectId).queryKey });
+    } catch (error) {
+      showAlert(error instanceof Error ? error.message : String(error), "error");
+    }
+  }, [projectId]);
+  const restoreArchivedRegion = useCallback((id: string) => {
+    void archiveExperiment(id, effectiveScope === "agent" ? "taskRegion" : "region", false);
+  }, [archiveExperiment, effectiveScope]);
   // Runs are scoped by their experiment's owner, not by which session launched them.
   const scopedRuns = useMemo(() => {
     if (effectiveScope !== "agent") return runs;
@@ -652,18 +675,21 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     }
     previousTreeScope.current = { projectId, taskId: activeSessionId, scope: effectiveScope };
   }, [workspaceReady, experimentDataReady, destination?.kind, projectId, activeSessionId, effectiveScope]);
-  const onActiveSessionChange = useCallback((sessionId: string | null, options?: { replace?: boolean }) => {
-    if (!projectId) return;
-    if (sessionId) {
+  const onActiveSessionChange = useCallback((sessionId: string | null, options?: { replace?: boolean; projectId?: string }) => {
+    // `/resume` reaches chats in other projects; everything below is per-project.
+    const target = options?.projectId ?? projectId;
+    if (!target) return;
+    const sameProject = target === projectId;
+    if (sessionId && sameProject) {
       if (options?.replace && activeSessionId === null) {
         captureWorkspace();
-        inheritNewTaskWorkspace(projectId, sessionId);
+        inheritNewTaskWorkspace(target, sessionId);
       }
     }
-    const saved = getTaskWorkspace(getCachedProjectWorkspace(projectId), sessionId ?? "new");
-    const remembered = saved ? saved.active : (isDemoProjectId(projectId) ? defaultTaskWorkspace(sessionId ?? undefined, tourCompletedRef.current === false)?.active : undefined);
-    const nextPane = options?.replace && sessionId && activeSessionId === null ? navigationRef.current.pane : remembered;
-    void router.navigate({ href: taskLocation(projectId, sessionId, nextPane), replace: options?.replace });
+    const saved = getTaskWorkspace(getCachedProjectWorkspace(target), sessionId ?? "new");
+    const remembered = saved ? saved.active : (isDemoProjectId(target) ? defaultTaskWorkspace(sessionId ?? undefined, tourCompletedRef.current === false)?.active : undefined);
+    const nextPane = sameProject && options?.replace && sessionId && activeSessionId === null ? navigationRef.current.pane : remembered;
+    void router.navigate({ href: taskLocation(target, sessionId, nextPane), replace: sameProject && options?.replace });
   }, [router, projectId, activeSessionId, captureWorkspace]);
   useEffect(() => {
     if (workspaceReady && destination?.kind !== "task" && !rememberedSessionRef.current && workspaceRef.current.lastTaskId && sessions?.includes(workspaceRef.current.lastTaskId)) {
@@ -1790,6 +1816,17 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             <span>{m.app_entire_project()}</span>
                             {effectiveScope === "project" && <Check size={13} />}
                           </MenuItem>
+                          <div className="my-1 border-t border-border-variant" />
+                          <MenuItem
+                            aria-pressed={showArchivedExperiments}
+                            onClick={() => {
+                              setShowArchivedExperiments((show) => !show);
+                              setScopeMenuOpen(false);
+                            }}
+                          >
+                            <span>{m.app_show_archived_experiments()}</span>
+                            {showArchivedExperiments && <Check size={13} />}
+                          </MenuItem>
                         </div>
                       )}
                     </div>
@@ -1820,25 +1857,32 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                     activeProject && (
                       <TreeView
                         experiments={experiments}
+                        archiveActions={archiveActions}
+                        showArchived={showArchivedExperiments}
                         runs={scopedRuns}
                         project={activeProject}
                         onOpenView={openExperimentTab}
                         onOpenCode={openCodeTabForExperiment}
+                        onArchive={archiveExperiment}
                         agentSessionId={effectiveScope === "agent" ? activeSessionId : null}
                         onShowProjectScope={showProjectScope}
+                        onRestoreRegion={restoreArchivedRegion}
                         viewport={treeViewport}
                         onViewportChange={setTreeViewport}
                       />
                     )
                   ) : (
                     <ExperimentsTable
+                      archiveActions={archiveActions}
                       runs={scopedRuns}
                       emptyHint={
-                        effectiveScope === "agent" && experiments.length > 0
+                        !showArchivedExperiments && scopedExperiments.length > 0 && visibleScopedExperiments.length === 0
+                          ? m.tree_all_experiments_archived()
+                          : effectiveScope === "agent" && experiments.length > 0
                           ? m.app_no_task_experiments()
                           : undefined
                       }
-                      experiments={scopedExperiments}
+                      experiments={visibleScopedExperiments}
                       onOpen={(experiment, intent) => {
                         openExperimentTab(experiment.id, "overview", intent);
                       }}
@@ -1855,6 +1899,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                             intent,
                           );
                       }}
+                      onArchive={archiveExperiment}
                       onCancel={cancelRun}
                     />
                   )}
@@ -1987,6 +2032,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
               </TabBody>
             ) : subagentTab ? (
               <SubagentTab
+                projectId={projectId}
                 // Remount per spawn part so the seed + subscription reset cleanly.
                 key={subagentTab.spawnPartId}
                 sessionId={subagentTab.sessionId}

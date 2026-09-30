@@ -113,6 +113,7 @@ export function ModelPicker({
   defaultReasoningId,
   onSelectReasoning,
   lockHarness = false,
+  openRequest = 0,
   className,
 }: {
   value: ModelSelection | null;
@@ -128,6 +129,8 @@ export function ModelPicker({
    * harness is fixed for its lifetime, so you can still switch models within it
    * but not switch to a different harness. */
   lockHarness?: boolean;
+  /** Bumped to open the picker from elsewhere (the composer's `/model`). */
+  openRequest?: number;
   className?: string;
 }) {
   const { data: harnesses = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
@@ -144,6 +147,16 @@ export function ModelPicker({
     setPage("root");
     setFilter("");
   };
+
+  // Seeded with the mount value so a remount doesn't replay an old request.
+  const handledOpenRequest = useRef(openRequest);
+  useEffect(() => {
+    if (openRequest === handledOpenRequest.current) return;
+    handledOpenRequest.current = openRequest;
+    setPage("models");
+    setFilter("");
+    setOpen(true);
+  }, [openRequest, setOpen]);
 
   useEffect(() => {
     if (open && (page === "reasoning" || page === "speed" || page === "permissions")) {
@@ -187,7 +200,9 @@ export function ModelPicker({
       reasoningLevel: reconcileReasoning(
         harness,
         model,
-        sameHarness ? value!.reasoningLevel : null,
+        sameHarness && harness.models.some((entry) => entry.id === model)
+          ? value!.reasoningLevel
+          : null,
       ),
     });
     close();
@@ -205,7 +220,7 @@ export function ModelPicker({
     ? value.model
       ? selected
         ? harnessModelLabel(selected)
-        : modelLabel(value.model)
+        : `${modelLabel(value.model)} · ${m.model_picker_unverified()}`
       : m.model_picker_default_model()
     : m.model_picker_model();
   const effectiveReasoningId = value?.reasoningLevel ?? defaultReasoningId ?? reasoningChoices[0]?.id;
@@ -359,7 +374,7 @@ export function ModelPicker({
               <input
                 autoFocus
                 type="text"
-                placeholder={m.model_picker_search_models()}
+                placeholder={m.model_picker_search_or_enter_id()}
                 value={filter}
                 onChange={(e) => setFilter(e.target.value)}
               />
@@ -373,31 +388,26 @@ export function ModelPicker({
                       </span>
                       {!harness.agentReady && (
                         <span className="model-group-status inline-flex items-center gap-1 text-accent-amber font-normal">
-                          <Lock size={10} /> {m.model_picker_unavailable()}
+                          {harness.catalogPending ? m.onboarding_checking() : <><Lock size={10} /> {m.model_picker_unavailable()}</>}
                         </span>
                       )}
                     </div>
                     {!harness.agentReady ? (
                       <div className="model-more [&_code]:font-mono [&_code]:text-xs [&_code]:bg-panel [&_code]:border [&_code]:border-border-variant [&_code]:rounded-xs [&_code]:py-px [&_code]:px-[5px] [&_code]:whitespace-nowrap pt-1 px-2 pb-2 text-sm text-muted model-unavailable leading-normal border-b border-b-border-variant">
-                        {harness.agentNote ? renderNote(harness.agentNote) : m.model_picker_not_available()}
+                        {harness.catalogPending ? m.onboarding_checking() : harness.agentNote ? renderNote(harness.agentNote) : m.model_picker_not_available()}
                       </div>
                     ) : (
                       <>
-                        {/* "Default model" (= send no --model, the CLI decides)
-                        only where the CLI advertises no catalog — a custom
-                        provider whose real models live behind its gateway.
-                        With a discovered catalog the row is redundant noise:
-                        the catalog's own default leads the list. */}
-                        {harness.models.length === 0 && (
+                        {!filter.trim() && (
                           <MenuItem onClick={() => pick(harness, null)}>
-                            <span>
-                              {m.model_picker_default_model()}
-                              <span className="model-id">{m.model_picker_cli_configuration()}</span>
-                            </span>
+                            <span>{m.model_picker_default_model()}</span>
                             {value?.harness === harness.id && value?.model === null && (
                               <Check size={13} />
                             )}
                           </MenuItem>
+                        )}
+                        {harness.models.length === 0 && harness.agentNote && (
+                          <div className={MODEL_MORE_CLASS_NAME}>{renderNote(harness.agentNote)}</div>
                         )}
                         {models.map((m) => (
                           <MenuItem
@@ -412,17 +422,14 @@ export function ModelPicker({
                             )}
                           </MenuItem>
                         ))}
-                        {/* Free-form escape hatch: the catalogs are curated menus,
-                        not the set of ids the CLIs accept — `--model
-                        claude-opus-5` works on a CLI whose menu doesn't list
-                        it. Typing an id not in the list offers it directly. */}
+                        {/* An explicit ID is passed to the CLI without claiming availability. */}
                         {filter.trim().length > 0 &&
                           !harness.models.some((m) => m.id === filter.trim()) && (
                             <MenuItem
                               onClick={() => pick(harness, filter.trim())}
                             >
                               <span>
-                                {m.model_picker_use_id({ id: ltr(filter.trim()) })}
+                                {m.model_picker_use_id({ id: ltr(filter.trim()) })} · {m.model_picker_unverified()}
                               </span>
                             </MenuItem>
                           )}

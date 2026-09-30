@@ -86,6 +86,7 @@ export interface Experiment {
   updatedAt: number;
   /** Chat session that created this experiment; null for dashboard/legacy rows. */
   chatSessionId?: string | null;
+  archived: boolean;
 }
 
 export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled";
@@ -110,6 +111,19 @@ export interface Run {
 export function runDisplayStatus(run: Pick<Run, "status" | "cancelRequested">): RunDisplayStatus {
   const live = run.status === "running" || run.status === "starting";
   return live && run.cancelRequested ? "cancelling" : run.status;
+}
+
+/** Why the supervisor can't currently observe a live run, if it can't. */
+export function runMonitoringError(run: Pick<Run, "status" | "backend">): string | null {
+  if (run.status !== "running" && run.status !== "starting") return null;
+  const error = run.backend?.monitoringError;
+  return typeof error === "string" && error ? error : null;
+}
+
+/** The newest live run's monitoring error: a forced relaunch can leave an older run live. */
+export function experimentMonitoringError(runs: Pick<Run, "status" | "backend" | "createdAt">[]): string | null {
+  const newestFirst = [...runs].sort((a, b) => b.createdAt - a.createdAt);
+  return newestFirst.map(runMonitoringError).find((error) => error !== null) ?? null;
 }
 
 const writeScopes = new WeakMap<Response, ReturnType<typeof workspaceScope>>();
@@ -373,6 +387,9 @@ export const listExperiments = (projectId: string, signal?: AbortSignal) =>
     (r) => r.experiments,
   );
 
+export const setExperimentArchived = (id: string, direction: "ancestors" | "descendants" | "only" | "region" | "taskRegion", archived: boolean) =>
+  patch<{ ids: string[] }>(`/api/experiments/${id}/archive`, { direction, archived });
+
 export const listRuns = (projectId: string, signal?: AbortSignal) =>
   get<{ runs: Run[] }>(`/api/projects/${projectId}/runs`, signal).then((r) => r.runs);
 
@@ -514,6 +531,17 @@ export const openFileInEditor = (
   opts: { sessionId?: string } = {},
 ) =>
   post<{ ok: boolean }>(`/api/projects/${projectId}/file/open`, {
+    path,
+    sessionId: opts.sessionId,
+  });
+
+/** Reveal a checkout file in the OS file manager on the machine running `orx up`. */
+export const revealFileInManager = (
+  projectId: string,
+  path: string,
+  opts: { sessionId?: string } = {},
+) =>
+  post<{ ok: boolean }>(`/api/projects/${projectId}/file/reveal`, {
     path,
     sessionId: opts.sessionId,
   });
@@ -811,14 +839,15 @@ export const saveTinkerKey = (key: string) => post<TinkerSettings>("/api/setting
 
 // --- updates ------------------------------------------------------------------
 
-/** How orx was installed. `installer`, `app-bundle` and `portable` update themselves. */
-export type InstallChannel = "installer" | "app-bundle" | "portable" | "cargo" | "homebrew" | "nix" | "unknown";
+/** How orx was installed. `installer`, `app-bundle`, `appimage` and `portable` update themselves. */
+export type InstallChannel = "installer" | "app-bundle" | "appimage" | "portable" | "cargo" | "homebrew" | "nix" | "unknown";
 
 export interface UpdateStatus {
   current: string;
   /** Latest release this install can actually move to — the macOS app and the
    *  CLI read different manifests, and the app's can lag. */
   latest: string | null;
+  latestTag: string | null;
   channel: InstallChannel;
   /** Whether this install is one orx can replace at all. */
   selfUpdates: boolean;
@@ -829,6 +858,7 @@ export interface UpdateStatus {
   /** The newer version already on disk. Distinct from `latest`: a release can
    *  land between the install and the restart. */
   installedVersion: string | null;
+  installedTag: string | null;
   restartRequired: boolean;
   /** Whether `restartApp` is honored; always true today, kept for a channel that cannot. */
   canRestart: boolean;
@@ -953,6 +983,7 @@ export const moveDataDir = (path: string) =>
   post<{ started: boolean }>("/api/settings/data-dir/move", { path });
 
 export interface SshHost {
+  container?: string | null;
   host: string;
   hostname?: string;
   user?: string;
@@ -962,8 +993,16 @@ export interface SshHost {
   lastTest?: SshPreflight;
 }
 
-export const getSshHosts = (signal?: AbortSignal) =>
-  get<{ hosts: SshHost[] }>("/api/settings/ssh", signal).then((r) => r.hosts);
+export interface SshSettings { hosts: SshHost[]; defaultHost: string | null }
+export const getSshSettings = (signal?: AbortSignal) => get<SshSettings>("/api/settings/ssh", signal);
+export const saveSshHost = (body: { host: string; container: string | null }) =>
+  post<{ ok: boolean }>("/api/settings/ssh", body);
+export const saveSshDefault = (host: string | null) => post<{ ok: boolean }>("/api/settings/ssh/default", { host });
+export interface SshExecutionPreflight extends SshPreflight {
+  container: { reference: string; ready: boolean; error: string | null } | null;
+}
+export const testSshExecution = (host: string, container: string | null) =>
+  post<SshExecutionPreflight>("/api/settings/ssh/preflight", { host, container });
 
 export interface SshConfigFile {
   path: string;
@@ -1359,6 +1398,7 @@ export interface LitSourcesSettings {
   alphaxiv: boolean;
   openalex: boolean;
   biorxiv: boolean;
+  pubmed: boolean;
 }
 
 export const getLitSources = (signal?: AbortSignal) =>
@@ -1466,6 +1506,11 @@ export const captureUiEvent = (event: UiEvent): void => {
   void post<{ ok: boolean }>("/api/telemetry/event", event).catch(() => {});
 };
 
+/** Tells orx which language the dashboard displays, for usage analytics. Fire-and-forget. */
+export const reportLocale = (locale: string): void => {
+  void post<{ locale: string }>("/api/telemetry/locale", { locale }).catch(() => {});
+};
+
 export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity";
 
 export interface HarnessModel {
@@ -1479,8 +1524,7 @@ export interface HarnessModel {
    * directly.
    */
   reasoningLevels?: OptionChoice[];
-  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). Absent on
-   * statically-listed fallback models — derive from the id then. */
+  /** The catalog's own human name ("Opus", "GPT-5.6 Sol"). */
   displayName?: string;
   /** The catalog's one-line blurb. For Claude this carries the resolved
    * version ("Opus 4.8 with 1M context · …") — its aliases don't. */
@@ -1633,24 +1677,38 @@ export interface Harness {
   version?: string;
   authenticated: boolean;
   authState: "ready" | "needsLogin" | "unknown" | "unsupported";
-  authMethod?: "oauth" | "apiKey" | "local";
+  authMethod?: "oauth" | "apiKey" | "thirdParty" | "local";
+  authProvider?: string;
+  loginEligible?: boolean;
+  authCheckFailed?: boolean;
   accountLoading?: boolean;
   account?: string;
   org?: string;
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
+  /** Setup is blocked by something no install/update/login command repairs —
+   * an environment credential overriding the saved login, a database the CLI
+   * will not open. `agentNote` carries the repair; offer no setup button. */
+  needsConfigRepair?: boolean;
   /** A running turn takes further input, so the composer steers instead of
    * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
   /** Capability: harness can probe the rolling ~5h usage window. */
   supportsFiveHourQuotaProbe: boolean;
+  /** A snapshot answer whose model catalog is still filling in the
+   * background — `models` stays empty until `harness.catalog`
+   * arrives and a plain re-read swaps in the real list. */
+  catalogPending?: boolean;
   models: HarnessModel[];
   options: HarnessOptions;
 }
 
 export interface HarnessSetupCommands {
   install: string;
+  /** The vendor bootstrap URL an install note quotes; `install` runs the
+   * platform's own installer, which on Windows is a PowerShell script. */
+  installUrl?: string;
   login: string;
   update: string;
   requiresNpm: boolean;
@@ -1674,10 +1732,13 @@ export interface SkillInfo {
   harness?: string | null;
   description: string;
   /** Built-in composer commands share the menu with harness/user skills. */
-  source?: "builtin" | "user" | "command";
+  source?: "builtin" | "user" | "project" | "command";
 }
 
-export const getSkills = (signal?: AbortSignal, harness?: string) => get<{ skills: SkillInfo[]; importing: boolean }>(`/api/skills${harness ? `?harness=${encodeURIComponent(harness)}` : ""}`, signal);
+export const getSkills = (signal?: AbortSignal, harness?: string, projectId?: string) => {
+  const query = new URLSearchParams({ ...(harness ? { harness } : {}), ...(projectId ? { project: projectId } : {}) });
+  return get<{ skills: SkillInfo[]; importing: boolean }>(`/api/skills${query.size ? `?${query}` : ""}`, signal);
+};
 
 export const getSkillContent = (name: string, projectId?: string, signal?: AbortSignal, harness?: string | null) =>
   get<{ content: string }>(
@@ -1851,6 +1912,8 @@ export interface ChatSession {
   permissionMode: string | null;
   /** Independent Plan axis for Codex/OpenCode/Cursor. */
   planMode: boolean;
+  /** What `/goal` asked the agent to keep working toward; null when unset. */
+  goal?: string | null;
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
@@ -1871,6 +1934,31 @@ export const listChatSessions = (projectId: string, signal?: AbortSignal) =>
     `/api/chat/sessions?projectId=${encodeURIComponent(projectId)}`,
     signal,
   ).then((r) => r.sessions);
+
+/** A chat the user had in an agent's own CLI, which orx has no session for. */
+export interface NativeChat {
+  harness: HarnessId;
+  nativeId: string;
+  title: string | null;
+  cwd: string | null;
+  updatedAt: number;
+}
+
+export const listNativeChats = (signal?: AbortSignal) =>
+  get<{ chats: NativeChat[] }>("/api/chat/native-sessions", signal).then((r) => r.chats);
+
+/** Adopt one, as a session that resumes the agent's own chat. */
+export const importNativeChat = (projectId: string, chat: NativeChat) =>
+  post<{ session: ChatSession }>("/api/chat/native-sessions/import", {
+    projectId,
+    harness: chat.harness,
+    nativeId: chat.nativeId,
+    title: chat.title,
+  }).then((r) => r.session);
+
+/** Every project's sessions, newest first, for the composer's `/resume` picker. */
+export const listAllChatSessions = (signal?: AbortSignal) =>
+  get<{ sessions: ChatSession[] }>("/api/chat/sessions?scope=all", signal).then((r) => r.sessions);
 
 /** Per-session (and per-turn) composer selections beyond the harness itself. */
 export interface TurnOptions {
@@ -1910,6 +1998,12 @@ export const renameChatSession = (sessionId: string, title: string) =>
 /** Enter/leave the session-specific Plan axis used by Codex/OpenCode/Cursor. */
 export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
   patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { planMode }).then(
+    (r) => r.session,
+  );
+
+/** `null` clears the goal. */
+export const setChatSessionGoal = (sessionId: string, goal: string | null) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal }).then(
     (r) => r.session,
   );
 
@@ -1995,6 +2089,10 @@ export const sendChatMessage = (
     mode,
   },
   );
+
+/** Compact a chat's context: natively where the agent can, else by summarizing. */
+export const compactChatSession = (sessionId: string) =>
+  post<{ message: ChatMessage }>(`/api/chat/sessions/${sessionId}/compact`, {});
 
 /** A composer `!` command, run in the session's checkout and recorded on its
  * transcript as a user-side exchange the next turn is told about. */
@@ -2128,7 +2226,13 @@ export function backendDetail(backend: Run["backend"]): string {
   if (typeof backend.manifest === "string" && backend.manifest) return backend.manifest;
   // Ray's namespace is the whole Jobs URL — too long for a badge.
   if (backendKind(backend) === "ray_job") return "";
-  if (typeof backend.namespace === "string" && backend.namespace) return backend.namespace;
+  if (typeof backend.namespace === "string" && backend.namespace) {
+    const container = backend.sshContainer;
+    if (container && typeof container === "object" && "reference" in container && typeof container.reference === "string") {
+      return `${backend.namespace} / ${container.reference}`;
+    }
+    return backend.namespace;
+  }
   return "";
 }
 
