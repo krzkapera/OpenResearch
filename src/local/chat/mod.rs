@@ -8671,7 +8671,6 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
 /// `launching_chat_session`) and `orx exp wake` can register the current chat.
 pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 
-
 /// Harness label paired with [`CHAT_SESSION_ENV`] for child telemetry.
 pub const CHAT_HARNESS_ENV: &str = "ORX_CHAT_HARNESS";
 
