@@ -69,7 +69,40 @@ fn total_memory_bytes() -> Option<u64> {
     };
     let pages = u64::try_from(pages).ok()?;
     let page_size = u64::try_from(page_size).ok()?;
-    pages.checked_mul(page_size)
+    let physical = pages.checked_mul(page_size)?;
+    // In a container sysconf reports the host's RAM; the container's own limit is
+    // what /proc/meminfo (LXCFS) and the cgroup v2 memory.max say.
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok();
+        let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
+        return Some(container_memory_limit(
+            physical,
+            meminfo.as_deref(),
+            cgroup.as_deref(),
+        ));
+    }
+    #[allow(unreachable_code)]
+    Some(physical)
+}
+
+/// The smallest of the physical RAM, `/proc/meminfo`'s `MemTotal` and a numeric
+/// cgroup v2 `memory.max` (`max` means unlimited).
+#[cfg(any(target_os = "linux", test))]
+fn container_memory_limit(physical: u64, meminfo: Option<&str>, cgroup_max: Option<&str>) -> u64 {
+    let mem_total = meminfo.and_then(|text| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|rest| rest.trim().strip_suffix("kB"))
+            .and_then(|kib| kib.trim().parse::<u64>().ok())
+            .map(|kib| kib * 1024)
+    });
+    let cgroup = cgroup_max.and_then(|text| text.trim().parse::<u64>().ok());
+    [Some(physical), mem_total, cgroup]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(physical)
 }
 
 #[cfg(windows)]
@@ -104,6 +137,25 @@ mod tests {
             IdlePolicy::DEFAULT
         );
         assert_eq!(IdlePolicy::for_total_memory(None), IdlePolicy::DEFAULT);
+    }
+
+    #[test]
+    fn a_container_limit_wins_over_the_hosts_ram() {
+        let host = 126 * GIB;
+        let meminfo = "MemTotal:        4194304 kB\nMemFree:          100 kB\n";
+        assert_eq!(
+            container_memory_limit(host, Some(meminfo), Some("max\n")),
+            4 * GIB
+        );
+        assert_eq!(
+            container_memory_limit(host, None, Some("2147483648\n")),
+            2 * GIB
+        );
+        assert_eq!(container_memory_limit(host, None, None), host);
+        assert_eq!(
+            container_memory_limit(8 * GIB, Some("garbage"), Some("max")),
+            8 * GIB
+        );
     }
 
     #[test]
