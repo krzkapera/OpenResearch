@@ -35,6 +35,13 @@ impl LocalPlane {
             .ok_or_else(|| anyhow!("internal: local plane missing its experiment row"))
     }
 
+    /// Demo analytics label for a launch, keyed on the experiment's owning project.
+    pub(super) fn demo_run_label(&self) -> Option<&'static str> {
+        self.experiment
+            .as_ref()
+            .and_then(crate::local::demo::run_label)
+    }
+
     pub async fn list_runs(&self) -> Result<RunListing> {
         let store = &self.store;
         let project_id = &self.id;
@@ -252,6 +259,7 @@ impl LocalPlane {
             args.backend = Some("local".to_string());
         }
         crate::compute::validate_run_args(&args)?;
+        args.agent_origin = crate::agent_origin();
         // Coarse backend label for analytics; the backend name is already an
         // enum, never user data. Recorded before the (borrowing) dispatch below.
         let backend_label = args.backend.clone();
@@ -315,8 +323,8 @@ impl LocalPlane {
             crate::telemetry::capture_experiment_started("run", true, Some(target));
             // A launch out of the bundled demo is the clearest signal the demo
             // converted into real work, so it is counted separately.
-            if self.id == crate::local::demo::PROJECT_ID {
-                crate::telemetry::capture_demo_experiment_started("run", target);
+            if let Some(label) = self.demo_run_label() {
+                crate::telemetry::capture_demo_experiment_started("run", label);
                 crate::telemetry::capture_first_action("demo", "run_experiment");
             }
         }

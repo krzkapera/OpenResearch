@@ -21,6 +21,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 
 use crate::error::{anyhow, Result};
+use crate::local::autonomy::Autonomy;
 use crate::local::harness::ResumeAction;
 use crate::local::model::LocalProject;
 use crate::local::opencode::AgentHost;
@@ -1183,9 +1184,10 @@ pub fn import_native_chat(
         context_usage_json: None,
         bootstrap_context: None,
         goal: None,
-        auto_resume: false,
+        autonomy: None,
         active_leaf_id: None,
         parent_session_id: None,
+        side_parent_session_id: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -1241,8 +1243,9 @@ pub fn session_json(s: &StoredChatSession, busy: bool) -> Value {
         "contextUsage": context_usage,
         "activeLeafId": s.active_leaf_id,
         "parentSessionId": s.parent_session_id,
-        "autoResume": s.auto_resume,
+        "sideParentSessionId": s.side_parent_session_id,
         "goal": s.goal,
+        "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
 }
 
@@ -1271,6 +1274,7 @@ fn with_turn_context(
     native_session_id: Option<&str>,
     bootstrap_context: Option<&str>,
     goal: Option<&str>,
+    autonomy: Option<&str>,
     demo_evidence_context: Option<&str>,
     shell_context: Option<&str>,
     text: String,
@@ -1288,6 +1292,9 @@ fn with_turn_context(
     });
     if let Some(goal) = goal.as_deref() {
         contexts.push(goal);
+    }
+    if let Some(autonomy) = autonomy {
+        contexts.push(autonomy);
     }
     if let Some(context) = demo_evidence_context {
         contexts.push(context);
@@ -1719,6 +1726,7 @@ impl ChatHost {
                 timeout: COMPACT_SUMMARY_TIMEOUT,
             })
             .await
+            .ok()
             .filter(|summary| !summary.trim().is_empty())
             .ok_or_else(|| anyhow!("{} could not summarize this chat", session.harness))?;
         Ok(format!(
@@ -2008,6 +2016,7 @@ mod shell_command_tests {
             None,
             None,
             None,
+            None,
             Some(&context),
             "why?".into(),
         );
@@ -2024,6 +2033,7 @@ mod initial_message_tests {
         contextualize_messages, is_initial_chat_message, with_selected_chat_context,
         with_turn_context, AnnotatedText, TextAnnotation,
     };
+    use crate::local::autonomy::Autonomy;
     use serde_json::{json, Value};
 
     #[test]
@@ -2041,6 +2051,7 @@ mod initial_message_tests {
             None,
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("prior demo"));
@@ -2052,12 +2063,13 @@ mod initial_message_tests {
                 None,
                 None,
                 None,
+                None,
                 "continue".into()
             ),
             "continue"
         );
         assert_eq!(
-            with_turn_context(None, None, None, None, None, "continue".into()),
+            with_turn_context(None, None, None, None, None, None, "continue".into()),
             "continue"
         );
     }
@@ -2070,6 +2082,7 @@ mod initial_message_tests {
             Some("ship the sweep"),
             None,
             None,
+            None,
             "continue".into(),
         );
         assert!(seeded.contains("ship the sweep"));
@@ -2078,9 +2091,34 @@ mod initial_message_tests {
         assert!(!seeded.contains("prior demo"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "continue".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "continue".into()
+            ),
             "continue"
         );
+    }
+
+    #[test]
+    fn autonomy_rides_every_turn_after_the_goal() {
+        let turn = with_turn_context(
+            Some("native"),
+            None,
+            Some("ship the sweep"),
+            Autonomy::Copilot.turn_context(),
+            None,
+            None,
+            "continue".into(),
+        );
+        let goal = turn.find("<orx-goal>").unwrap();
+        let autonomy = turn.find("<orx-autonomy level=\"copilot\">").unwrap();
+        assert!(goal < autonomy);
+        assert!(turn.ends_with("<current-user-message>\ncontinue\n</current-user-message>"));
     }
 
     #[test]
@@ -2089,6 +2127,7 @@ mod initial_message_tests {
             None,
             Some("prior demo"),
             None,
+            None,
             Some("demo evidence"),
             None,
             "first".into(),
@@ -2096,6 +2135,7 @@ mod initial_message_tests {
         let follow_up = with_turn_context(
             Some("native"),
             Some("prior demo"),
+            None,
             None,
             Some("demo evidence"),
             None,
@@ -2108,7 +2148,15 @@ mod initial_message_tests {
         assert!(follow_up.contains("<current-user-message>\nfollow up"));
         assert_eq!(first.matches("<current-user-message>").count(), 1);
         assert_eq!(
-            with_turn_context(Some("native"), None, None, None, None, "ordinary".into()),
+            with_turn_context(
+                Some("native"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ordinary".into()
+            ),
             "ordinary"
         );
     }
@@ -2304,6 +2352,8 @@ pub struct ChatHost {
     turns: Mutex<HashMap<String, TurnState>>,
     /// Cross-process ownership tokens for locally active turn slots.
     durable_turns: std::sync::Mutex<HashMap<String, String>>,
+    /// Set once `orx up` commits to restarting into an update; no turn starts after.
+    restarting: std::sync::atomic::AtomicBool,
     deleting_sessions: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per-session serialization for `respond`. Answering a prompt reads the
     /// card, delivers the answer (a non-idempotent POST for inline harnesses),
@@ -3258,6 +3308,7 @@ impl ChatHost {
             events,
             turns: Mutex::new(HashMap::new()),
             durable_turns: std::sync::Mutex::new(HashMap::new()),
+            restarting: std::sync::atomic::AtomicBool::new(false),
             deleting_sessions: Arc::new(std::sync::Mutex::new(HashSet::new())),
             respond_locks: Mutex::new(HashMap::new()),
             msg_write: std::sync::Mutex::new(()),
@@ -3635,7 +3686,23 @@ impl ChatHost {
         f()
     }
 
+    /// Stop admitting turns if none is running, queued, or awaiting an answer. Every
+    /// admission claims under the turn map's lock, so none can slip in after this check.
+    pub async fn stop_admitting_if_idle(&self) -> bool {
+        let turns = self.turns.lock().await;
+        let idle =
+            turns.is_empty() && self.queued_count() == 0 && self.pending_permission_count() == 0;
+        if idle {
+            self.restarting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        idle
+    }
+
     fn claim_durable_turn(&self, session_id: &str) -> bool {
+        if self.restarting.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
         let mut claims = self.durable_turns.lock().unwrap();
         if claims.contains_key(session_id) {
             return false;
@@ -5491,6 +5558,7 @@ impl ChatHost {
                 session.native_session_id.as_deref(),
                 session.bootstrap_context.as_deref(),
                 session.goal.as_deref(),
+                Autonomy::from_stored(session.autonomy.as_deref()).turn_context(),
                 super::demo::turn_context(&project.id),
                 shell_context.as_deref(),
                 expanded,
@@ -5735,24 +5803,6 @@ impl ChatHost {
                     .unwrap_or(false);
                 if changed {
                     ctx.push_turn_failure(&kind, message.clone(), action);
-                    // Do not block turn settlement on a quota probe (can take seconds).
-                    let session_id = ctx.session_id.clone();
-                    let turn_id = ctx.turn_id.clone();
-                    let harness = ctx.harness.clone();
-                    let action = action.to_string();
-                    let kind = kind.clone();
-                    let message = message.clone();
-                    tokio::spawn(async move {
-                        maybe_queue_auto_resume_after_failure(
-                            &session_id,
-                            &turn_id,
-                            &harness,
-                            &action,
-                            &kind,
-                            &message,
-                        )
-                        .await;
-                    });
                 }
                 if changed && ctx.retry_exhausted {
                     crate::telemetry::capture(
@@ -6294,6 +6344,25 @@ impl ChatHost {
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
+    /// Branch a side chat off `parent`, seeded with a snapshot of the parent's
+    /// live branch as it is right now.
+    pub async fn open_side_chat(&self, parent: &StoredChatSession) -> Result<StoredChatSession> {
+        let store = Store::open()?;
+        let messages = store.list_chat_messages(&parent.id)?;
+        let session = side_chat_session(parent, &messages);
+        store.create_chat_session(&session)?;
+        // Checked after the insert: a parent delete that began earlier has
+        // already listed its side chats and would miss this one.
+        if self.deleting_sessions.lock().unwrap().contains(&parent.id)
+            || store.get_chat_session(&parent.id)?.is_none()
+        {
+            store.delete_chat_session(&session.id)?;
+            return Err(anyhow!("chat session is gone"));
+        }
+        self.emit_session(Some(session.clone())).await;
+        Ok(session)
+    }
+
     /// Set (or, with `None`, clear) the goal every turn is reminded of.
     pub async fn set_goal(
         &self,
@@ -6302,6 +6371,16 @@ impl ChatHost {
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
         store.set_chat_session_goal(session_id, goal)?;
+        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    pub async fn set_autonomy(
+        &self,
+        session_id: &str,
+        autonomy: Autonomy,
+    ) -> Result<Option<StoredChatSession>> {
+        let store = Store::open()?;
+        store.set_chat_session_autonomy(session_id, autonomy)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -6347,19 +6426,6 @@ impl ChatHost {
             }
         }
         self.emit_queued(session_id);
-        Ok(self.emit_session(store.get_chat_session(session_id)?).await)
-    }
-
-    pub async fn set_auto_resume(
-        &self,
-        session_id: &str,
-        auto_resume: bool,
-    ) -> Result<Option<StoredChatSession>> {
-        let store = Store::open()?;
-        if store.get_chat_session(session_id)?.is_none() {
-            return Ok(None);
-        }
-        store.set_chat_session_auto_resume(session_id, auto_resume)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
     }
 
@@ -6445,6 +6511,9 @@ impl ChatHost {
         let _deleting = self
             .begin_session_delete(session_id)
             .ok_or_else(|| anyhow!("session deletion is already in progress"))?;
+        for side_chat in Store::open()?.side_chats_of(session_id)? {
+            let _ = Box::pin(self.delete_session(&side_chat)).await;
+        }
         self.clear_queue(session_id)?;
         let _ = self.interrupt(session_id).await;
         // A live opencode serve child would keep running in (and lock) the
@@ -6477,12 +6546,16 @@ impl ChatHost {
             .retain(|(queued_session_id, _), _| queued_session_id != session_id);
         let store = Store::open()?;
         let session = store.get_chat_session(session_id)?;
+        let worktree_owner = store.chat_worktree_owner(session_id)?;
         store.delete_chat_session(session_id)?;
         self.emit("chat.session.deleted", json!({ "sessionId": session_id }));
         if let Some(session) = session {
             cleanup_session_transcript_artifacts(&session.id);
-            if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
-                cleanup_session_worktree(&project, session_id);
+            // A side chat runs in its parent's worktree, which outlives it.
+            if worktree_owner == session_id {
+                if let Ok(Some(project)) = store.get_local_project(&session.project_id) {
+                    cleanup_session_worktree(&project, session_id);
+                }
             }
         }
         Ok(())
@@ -7100,6 +7173,7 @@ impl TurnCtx {
         &self,
         native_scope: &str,
         native_turn: &str,
+        model: Option<&str>,
         total: crate::store::TokenUsage,
         last: crate::store::TokenUsage,
     ) {
@@ -7112,6 +7186,7 @@ impl TurnCtx {
                 &self.harness,
                 native_scope,
                 native_turn,
+                model,
                 &total,
                 &last,
             )
@@ -7152,6 +7227,11 @@ impl TurnCtx {
         }) {
             eprintln!("orx up: could not reconcile native token usage: {error}");
         }
+    }
+
+    /// The execution native hooks record into; `None` when nothing is recorded.
+    pub(crate) fn usage_execution_id(&self) -> Option<&str> {
+        self.durable.then_some(self.usage_execution_id.as_str())
     }
 
     pub(crate) fn attempt_count_for_usage(&self) -> i64 {
@@ -7844,6 +7924,50 @@ fn active_path<'a>(
     path
 }
 
+fn side_chat_session(
+    parent: &StoredChatSession,
+    messages: &[StoredChatMessage],
+) -> StoredChatSession {
+    let snapshot = crate::local::harness::transcript_snapshot(active_path(
+        messages,
+        parent.active_leaf_id.as_deref(),
+    ));
+    let bootstrap_context = (!snapshot.is_empty()).then(|| {
+        format!(
+            "<orx-side-chat-context>\nThis is a side chat branched from another chat, which may still be running in this same worktree. Use this snapshot of that chat, taken when the side chat opened, to answer questions about its work. Do not modify files unless the user asks.\n{snapshot}\n</orx-side-chat-context>"
+        )
+    });
+    let now = now_ms();
+    StoredChatSession {
+        id: format!("chat_{}", uuid::Uuid::new_v4()),
+        project_id: parent.project_id.clone(),
+        harness: parent.harness.clone(),
+        native_session_id: None,
+        title: None,
+        title_source: None,
+        model: parent.model.clone(),
+        service_tier: parent.service_tier.clone(),
+        // Claude keeps Plan in its permission mode; a side chat starts outside Plan.
+        permission_mode: parent.permission_mode.clone().filter(|mode| {
+            crate::local::harness::permission_mode_for(&parent.harness, mode)
+                != Some(crate::local::harness::PermissionMode::Plan)
+        }),
+        plan_mode: false,
+        plan_reset_pending: false,
+        reasoning_level: parent.reasoning_level.clone(),
+        archived: false,
+        context_usage_json: None,
+        bootstrap_context,
+        goal: None,
+        autonomy: parent.autonomy.clone(),
+        active_leaf_id: None,
+        parent_session_id: None,
+        side_parent_session_id: Some(parent.id.clone()),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 /// Attachments of a turn being re-sampled. The files are already on disk from
 /// the original send, so a fork points at them instead of rewriting the bytes.
 fn replayed_attachments(parts: &[WirePart]) -> Result<Vec<SavedAttachment>> {
@@ -8466,197 +8590,16 @@ async fn deliver_wake_up(
     Ok(store)
 }
 
-/// Resume explicitly subscribed agent sessions after a run finishes. Busy and
-/// draining sessions retain their durable wake-up until they become idle.
-/// Background watcher: when a session failed on five-hour quota exhaustion and
-/// Auto-resume is ON, wait until reset_at (outside the model), re-probe, then
-/// recover once via the stored recovery_action (continue vs retry).
-pub async fn watch_auto_resume(
-    chat: Arc<ChatHost>,
-    data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
-    data_dir_gate: Arc<tokio::sync::Mutex<()>>,
-) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
-            continue;
-        }
-        let _data_dir_guard = data_dir_gate.lock().await;
-        if data_dir_move_in_progress.load(std::sync::atomic::Ordering::SeqCst) {
-            continue;
-        }
-        if let Err(err) = process_auto_resume_pending(&chat).await {
-            eprintln!("orx up: auto-resume watcher: {err}");
-        }
-    }
-}
-
-async fn process_auto_resume_pending(chat: &Arc<ChatHost>) -> Result<()> {
-    let now = now_ms();
-    let pending = {
-        let store = Store::open()?;
-        store.list_due_chat_auto_resume_pending(now)?
-    };
-    for row in pending {
-        let claimed = {
-            let store = Store::open()?;
-            store.claim_chat_auto_resume_pending(&row.session_id, &row.turn_id, now)?
-        };
-        if !claimed {
-            continue;
-        }
-        if chat.is_busy(&row.session_id).await {
-            let store = Store::open()?;
-            let _ = store.release_chat_auto_resume_pending(
-                &row.session_id,
-                &row.turn_id,
-                row.reset_at_ms.unwrap_or(now + 30_000),
-            );
-            continue;
-        }
-        let session = {
-            let store = Store::open()?;
-            store.get_chat_session(&row.session_id)?
-        };
-        let Some(session) = session else {
-            let store = Store::open()?;
-            let _ = store.finish_chat_auto_resume_pending(
-                &row.session_id,
-                &row.turn_id,
-                "missing_session",
-            );
-            continue;
-        };
-        if !session.auto_resume {
-            let store = Store::open()?;
-            let _ = store.finish_chat_auto_resume_pending(
-                &row.session_id,
-                &row.turn_id,
-                "auto_resume_off",
-            );
-            continue;
-        }
-        let Some(harness) = crate::local::harness::chat_harness(&session.harness) else {
-            let store = Store::open()?;
-            let _ =
-                store.finish_chat_auto_resume_pending(&row.session_id, &row.turn_id, "no_harness");
-            continue;
-        };
-        if !harness.supports_five_hour_quota_probe() {
-            let store = Store::open()?;
-            let _ =
-                store.finish_chat_auto_resume_pending(&row.session_id, &row.turn_id, "unsupported");
-            continue;
-        }
-        let probe = harness.probe_five_hour_quota().await;
-        match probe {
-            crate::local::harness::QuotaProbeResult::Available { .. } => {
-                let action = row.recovery_action.clone();
-                let empty = RecoveryOverrides {
-                    model: None,
-                    service_tier: None,
-                    permission_mode: None,
-                    plan_mode: None,
-                    reasoning_level: None,
-                };
-                match chat
-                    .recover_turn(&row.session_id, &row.turn_id, &action, empty)
-                    .await
-                {
-                    Ok(_) => {
-                        let store = Store::open()?;
-                        let _ = store.finish_chat_auto_resume_pending(
-                            &row.session_id,
-                            &row.turn_id,
-                            "recovered",
-                        );
-                        crate::telemetry::capture(
-                            "chat_auto_resume_recovered",
-                            json!({ "harness": session.harness, "action": action }),
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "orx up: auto-resume recover failed for {}: {err}",
-                            row.session_id
-                        );
-                        let store = Store::open()?;
-                        let _ = store.release_chat_auto_resume_pending(
-                            &row.session_id,
-                            &row.turn_id,
-                            now + 60_000,
-                        );
-                    }
-                }
-            }
-            crate::local::harness::QuotaProbeResult::Exhausted { reset_at_ms } => {
-                let wake = reset_at_ms.unwrap_or(now + 60_000).max(now + 15_000);
-                let store = Store::open()?;
-                let _ = store.release_chat_auto_resume_pending(&row.session_id, &row.turn_id, wake);
-            }
-            other => {
-                let store = Store::open()?;
-                let _ = store.release_chat_auto_resume_pending(
-                    &row.session_id,
-                    &row.turn_id,
-                    now + 60_000,
-                );
-                eprintln!(
-                    "orx up: auto-resume probe inconclusive for {}: {other:?}",
-                    row.session_id
-                );
-            }
-        }
+/// Side chats last only as long as the app run that opened them.
+pub async fn delete_side_chats(chat: &Arc<ChatHost>) -> Result<()> {
+    for session_id in Store::open()?.side_chat_ids()? {
+        chat.delete_session(&session_id).await?;
     }
     Ok(())
 }
 
-async fn maybe_queue_auto_resume_after_failure(
-    session_id: &str,
-    turn_id: &str,
-    harness_id: &str,
-    recovery_action: &str,
-    error_kind: &str,
-    error_message: &str,
-) {
-    let auto_resume = {
-        let Ok(store) = Store::open() else { return };
-        let Ok(Some(session)) = store.get_chat_session(session_id) else {
-            return;
-        };
-        session.auto_resume
-    };
-    if !auto_resume {
-        return;
-    }
-    let Some(harness) = crate::local::harness::chat_harness(harness_id) else {
-        return;
-    };
-    if !harness.supports_five_hour_quota_probe() {
-        return;
-    }
-    if !crate::local::harness::quota::looks_like_five_hour_quota_failure(error_kind, error_message)
-    {
-        return;
-    }
-    let probe = harness.probe_five_hour_quota().await;
-    let crate::local::harness::QuotaProbeResult::Exhausted { reset_at_ms } = probe else {
-        return;
-    };
-    let reset_at = reset_at_ms.unwrap_or_else(|| now_ms() + 60_000);
-    let Ok(store) = Store::open() else { return };
-    if let Err(err) =
-        store.upsert_chat_auto_resume_pending(session_id, turn_id, recovery_action, Some(reset_at))
-    {
-        eprintln!("orx up: could not queue auto-resume: {err}");
-        return;
-    }
-    crate::telemetry::capture(
-        "chat_auto_resume_queued",
-        json!({ "harness": harness_id, "resetAt": reset_at, "action": recovery_action }),
-    );
-}
-
+/// Resume explicitly subscribed agent sessions after a run finishes. Busy and
+/// draining sessions retain their durable wake-up until they become idle.
 pub async fn watch_runs(
     chat: Arc<ChatHost>,
     data_dir_move_in_progress: Arc<std::sync::atomic::AtomicBool>,
@@ -8728,10 +8671,6 @@ pub fn prepare_env(cmd: &mut tokio::process::Command) {
 /// `launching_chat_session`) and `orx exp wake` can register the current chat.
 pub const CHAT_SESSION_ENV: &str = "ORX_CHAT_SESSION_ID";
 
-/// Working-context label for tools that key off `BUS_SESSION` (e.g. ai-crew-sync
-/// `X-Crew-Session`). Same value as [`CHAT_SESSION_ENV`], under the name those
-/// configs conventionally expand.
-pub const BUS_SESSION_ENV: &str = "BUS_SESSION";
 
 /// Harness label paired with [`CHAT_SESSION_ENV`] for child telemetry.
 pub const CHAT_HARNESS_ENV: &str = "ORX_CHAT_HARNESS";
@@ -8743,6 +8682,9 @@ pub const LOCAL_SESSION_ENV: &str = "ORX_LOCAL_SESSION";
 
 /// Loopback port of the trusted `orx up` process that owns local agent runs.
 pub const UP_PORT_ENV: &str = "ORX_UP_PORT";
+
+/// Version of that `orx up`, which keeps running its own code after an update lands on disk.
+pub const UP_VERSION_ENV: &str = "ORX_UP_VERSION";
 
 /// Route-scoped bearer for agent subprocesses calling their owning `orx up`.
 pub const UP_AUTH_TOKEN_ENV: &str = "ORX_UP_AUTH_TOKEN";
@@ -8864,16 +8806,17 @@ pub fn set_chat_session_env(
     up_port: Option<u16>,
 ) {
     cmd.env(CHAT_SESSION_ENV, session_id);
-    cmd.env(BUS_SESSION_ENV, session_id);
     cmd.env(CHAT_HARNESS_ENV, harness);
     cmd.env(LOCAL_SESSION_ENV, "1");
     // Never let a child inherit a port owned by some outer orx up process.
     match up_port {
         Some(port) => {
             cmd.env(UP_PORT_ENV, port.to_string());
+            cmd.env(UP_VERSION_ENV, env!("CARGO_PKG_VERSION"));
         }
         None => {
             cmd.env_remove(UP_PORT_ENV);
+            cmd.env_remove(UP_VERSION_ENV);
         }
     }
     match up_auth_token() {
@@ -9050,6 +8993,30 @@ mod session_env_tests {
 
         std::env::set_var(LOCAL_SESSION_ENV, "1");
         assert!(in_local_session());
+    }
+
+    /// `orx up` handling a caller's run reads launch evidence only from the request, never from
+    /// its own environment.
+    #[test]
+    fn forwarded_runs_ignore_the_servers_launch_environment() {
+        let _guard = EnvGuard::new(&[CHAT_SESSION_ENV, "ORX_INVOCATION_CONTEXT"]);
+        std::env::set_var(CHAT_SESSION_ENV, "server-session");
+        std::env::set_var(
+            "ORX_INVOCATION_CONTEXT",
+            r#"{"harness":"codex","model":"gpt-6-sol","provider":null}"#,
+        );
+        let local = crate::compute::tests::tinker_args();
+        assert_eq!(
+            local.launching_chat_session().as_deref(),
+            Some("server-session")
+        );
+        assert!(local.invocation_identity().unwrap().is_some());
+        let forwarded = crate::ExpRunArgs {
+            forwarded: true,
+            ..crate::compute::tests::tinker_args()
+        };
+        assert_eq!(forwarded.launching_chat_session(), None);
+        assert!(forwarded.invocation_identity().unwrap().is_none());
     }
 
     #[test]
@@ -9298,9 +9265,10 @@ mod cap_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
-                auto_resume: false,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -9406,9 +9374,10 @@ mod cap_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
-            auto_resume: false,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -9463,9 +9432,10 @@ mod cap_tests {
             context_usage_json: Some("{\"usedTokens\":9000}".into()),
             bootstrap_context: None,
             goal: None,
-            auto_resume: false,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -9491,6 +9461,7 @@ mod cap_tests {
         assert!(with_turn_context(
             session.native_session_id.as_deref(),
             session.bootstrap_context.as_deref(),
+            None,
             None,
             None,
             None,
@@ -9967,6 +9938,19 @@ mod bridge_tests {
     }
 
     #[tokio::test]
+    async fn restart_stops_admitting_turns_only_when_idle() {
+        let host = test_host();
+        host.turns
+            .lock()
+            .await
+            .insert("busy".into(), TurnState::Reserved { turn_id: None });
+        assert!(!host.stop_admitting_if_idle().await);
+        host.turns.lock().await.clear();
+        assert!(host.stop_admitting_if_idle().await);
+        assert!(!host.claim_durable_turn("next"));
+    }
+
+    #[tokio::test]
     async fn claude_permission_reviews_are_serialized_per_session() {
         let host = test_host();
         let lock = host
@@ -10223,9 +10207,10 @@ mod bridge_tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
-            auto_resume: false,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -10379,9 +10364,10 @@ mod run_wakeup_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
-                auto_resume: false,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -11139,6 +11125,74 @@ mod transcript_tree_tests {
         assert_eq!(ids(active_path(&messages, Some("a2"))), ["u1", "a2"]);
     }
 
+    fn said(id: &str, role: &str, parent: Option<&str>, text: &str) -> StoredChatMessage {
+        StoredChatMessage {
+            parts_json: json!([{ "id": "p", "type": "text", "text": text }]).to_string(),
+            ..msg(id, role, parent)
+        }
+    }
+
+    fn parent_session(harness: &str) -> StoredChatSession {
+        StoredChatSession {
+            id: "chat_parent".into(),
+            project_id: "proj_1".into(),
+            harness: harness.into(),
+            native_session_id: Some("native-parent".into()),
+            title: Some("Parent".into()),
+            title_source: Some("user".into()),
+            model: Some("model-x".into()),
+            service_tier: None,
+            permission_mode: Some("bypass".into()),
+            plan_mode: false,
+            plan_reset_pending: false,
+            reasoning_level: Some("high".into()),
+            archived: false,
+            context_usage_json: None,
+            bootstrap_context: None,
+            goal: Some("keep training".into()),
+            autonomy: None,
+            active_leaf_id: Some("a3".into()),
+            parent_session_id: None,
+            side_parent_session_id: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn a_side_chat_is_seeded_from_the_parents_live_branch_only() {
+        let messages = vec![
+            said("u1", "user", None, "train the model"),
+            said("a1", "assistant", Some("u1"), "kept branch"),
+            said("a2", "assistant", Some("u1"), "abandoned retry"),
+            said("u2", "user", Some("a1"), "how is it going"),
+            said("a3", "assistant", Some("u2"), "loss is falling"),
+        ];
+        let side = side_chat_session(&parent_session("codex"), &messages);
+        let context = side.bootstrap_context.unwrap();
+        assert!(context.contains("kept branch") && context.contains("loss is falling"));
+        assert!(!context.contains("abandoned retry"));
+        assert_eq!(side.side_parent_session_id.as_deref(), Some("chat_parent"));
+        assert_eq!(side.native_session_id, None);
+        assert_eq!(side.goal, None);
+        assert_eq!(side.model.as_deref(), Some("model-x"));
+        assert_eq!(side.permission_mode.as_deref(), Some("bypass"));
+        assert!(!side.plan_mode);
+    }
+
+    #[test]
+    fn a_side_chat_leaves_claudes_plan_permission_behind() {
+        let mut parent = parent_session("claude-code");
+        parent.permission_mode = Some("plan".into());
+        assert_eq!(side_chat_session(&parent, &[]).permission_mode, None);
+    }
+
+    #[test]
+    fn a_side_chat_of_an_empty_chat_has_no_seed_context() {
+        let side = side_chat_session(&parent_session("claude-code"), &[]);
+        assert_eq!(side.bootstrap_context, None);
+    }
+
     #[test]
     fn active_path_without_a_leaf_keeps_the_whole_transcript() {
         let messages = forked();
@@ -11233,9 +11287,10 @@ mod steering_tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                autonomy: None,
                 active_leaf_id: None,
                 parent_session_id: None,
-                auto_resume: false,
+                side_parent_session_id: None,
                 created_at: 1,
                 updated_at: 1,
             })

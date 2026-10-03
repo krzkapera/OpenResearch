@@ -17,6 +17,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::error::{anyhow, Result};
+use crate::local::autonomy::Autonomy;
 use crate::local::model::{LocalExperiment, LocalProject};
 use crate::workspace_state::{GlobalWorkspaceState, WorkspaceState};
 
@@ -698,10 +699,12 @@ impl Store {
             "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
-            "ALTER TABLE chat_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN side_parent_session_id TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
+            "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
             "ALTER TABLE chat_spawns ADD COLUMN wake_parent INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE chat_spawns ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE chat_spawns ADD COLUMN finished_at INTEGER",
@@ -709,25 +712,6 @@ impl Store {
         ] {
             let _ = conn.execute(ddl, []);
         }
-
-        let _ = conn.execute(
-            "CREATE TABLE IF NOT EXISTS chat_auto_resume_pending (
-                session_id TEXT NOT NULL,
-                turn_id TEXT NOT NULL,
-                recovery_action TEXT NOT NULL,
-                reset_at_ms INTEGER,
-                state TEXT NOT NULL DEFAULT 'pending',
-                claim_token TEXT,
-                claimed_at INTEGER,
-                finished_at INTEGER,
-                finish_reason TEXT,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (session_id, turn_id)
-             )",
-            [],
-        );
-
         conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
         conn.execute(
             "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
@@ -956,7 +940,8 @@ impl Store {
         Ok(self.conn.query_row(
             "SELECT onboarding_completed, tour_completed, preferred_harness,
                     preferred_model, preferred_service_tier,
-                    preferred_permission_mode, preferred_reasoning_level, workspace_state_json
+                    preferred_permission_mode, preferred_reasoning_level, workspace_state_json,
+                    preferred_autonomy
              FROM ui_state WHERE id = 1",
             [],
             |row| {
@@ -979,6 +964,10 @@ impl Store {
                     workspace: workspace_json
                         .as_deref()
                         .and_then(GlobalWorkspaceState::from_stored),
+                    preferred_autonomy: row
+                        .get::<_, Option<String>>(8)?
+                        .as_deref()
+                        .and_then(Autonomy::from_id),
                 })
             },
         )?)
@@ -1026,6 +1015,14 @@ impl Store {
         self.conn.execute(
             "UPDATE ui_state SET tour_completed = ?1 WHERE id = 1",
             params![completed],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_preferred_autonomy(&self, autonomy: Autonomy) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET preferred_autonomy = ?1 WHERE id = 1",
+            params![autonomy.id()],
         )?;
         Ok(())
     }
@@ -1970,8 +1967,9 @@ impl Store {
         self.conn.execute(
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         service_tier, permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
-                                        active_leaf_id, parent_session_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                                        active_leaf_id, parent_session_id, created_at, updated_at, autonomy,
+                                        side_parent_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 s.id,
                 s.project_id,
@@ -1991,6 +1989,8 @@ impl Store {
                 s.parent_session_id,
                 s.created_at,
                 s.updated_at,
+                s.autonomy,
+                s.side_parent_session_id,
             ],
         )?;
         Ok(())
@@ -2020,10 +2020,43 @@ impl Store {
     /// long-lived install cannot turn one dialog open into a multi-megabyte read.
     pub fn list_all_chat_sessions(&self) -> Result<Vec<StoredChatSession>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions ORDER BY updated_at DESC LIMIT 500"
+            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions WHERE side_parent_session_id IS NULL
+             ORDER BY updated_at DESC LIMIT 500"
         ))?;
         let rows = stmt.query_map([], row_to_chat_session)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn side_chat_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn side_chats_of(&self, parent_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_sessions WHERE side_parent_session_id = ?1")?;
+        let rows = stmt.query_map(params![parent_id], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The session whose worktree `id` runs in: its side-chat parent while that
+    /// parent exists, else itself.
+    pub fn chat_worktree_owner(&self, id: &str) -> Result<String> {
+        let owner: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT parent.id FROM chat_sessions side
+                 JOIN chat_sessions parent ON parent.id = side.side_parent_session_id
+                 WHERE side.id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(owner.unwrap_or_else(|| id.to_string()))
     }
 
     pub fn list_chat_session_project_ids(&self) -> Result<Vec<(String, String)>> {
@@ -2041,6 +2074,7 @@ impl Store {
             "WITH agent_counts AS (
                  SELECT project_id, COUNT(*) AS total_agents
                  FROM chat_sessions
+                 WHERE side_parent_session_id IS NULL
                  GROUP BY project_id
              ),
              experiment_counts AS (
@@ -2157,97 +2191,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_chat_session_auto_resume(&self, id: &str, auto_resume: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE chat_sessions SET auto_resume = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, auto_resume as i64, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    pub fn upsert_chat_auto_resume_pending(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        recovery_action: &str,
-        reset_at_ms: Option<i64>,
-    ) -> Result<()> {
-        let now = now_ms();
-        self.conn.execute(
-            "INSERT INTO chat_auto_resume_pending
-                (session_id, turn_id, recovery_action, reset_at_ms, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?5)
-             ON CONFLICT(session_id, turn_id) DO UPDATE SET
-                recovery_action = excluded.recovery_action,
-                reset_at_ms = excluded.reset_at_ms,
-                state = 'pending',
-                claim_token = NULL,
-                claimed_at = NULL,
-                finished_at = NULL,
-                finish_reason = NULL,
-                updated_at = excluded.updated_at",
-            params![session_id, turn_id, recovery_action, reset_at_ms, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_due_chat_auto_resume_pending(
-        &self,
-        now_ms_val: i64,
-    ) -> Result<Vec<ChatAutoResumePending>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id, turn_id, recovery_action, reset_at_ms, state
-             FROM chat_auto_resume_pending
-             WHERE state = 'pending'
-               AND (reset_at_ms IS NULL OR reset_at_ms <= ?1)
-             ORDER BY COALESCE(reset_at_ms, 0) ASC, created_at ASC",
-        )?;
-        let rows = stmt
-            .query_map(params![now_ms_val], |row| {
-                Ok(ChatAutoResumePending {
-                    session_id: row.get(0)?,
-                    turn_id: row.get(1)?,
-                    recovery_action: row.get(2)?,
-                    reset_at_ms: row.get(3)?,
-                    state: row.get(4)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    pub fn claim_chat_auto_resume_pending(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        now_ms_val: i64,
-    ) -> Result<bool> {
-        let token = uuid::Uuid::new_v4().to_string();
-        let changed = self.conn.execute(
-            "UPDATE chat_auto_resume_pending
-             SET state = 'claimed', claim_token = ?3, claimed_at = ?4, updated_at = ?4
-             WHERE session_id = ?1 AND turn_id = ?2 AND state = 'pending'",
-            params![session_id, turn_id, token, now_ms_val],
-        )?;
-        Ok(changed > 0)
-    }
-
-    pub fn release_chat_auto_resume_pending(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        reset_at_ms: i64,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE chat_auto_resume_pending
-             SET state = 'pending', claim_token = NULL, claimed_at = NULL,
-                 reset_at_ms = ?3, updated_at = ?4
-             WHERE session_id = ?1 AND turn_id = ?2 AND state = 'claimed'",
-            params![session_id, turn_id, reset_at_ms, now_ms()],
-        )?;
-        Ok(())
-    }
-
     /// The session bound to an agent's own chat, if one was already adopted.
     pub fn chat_session_for_native_id(&self, native_id: &str) -> Result<Option<StoredChatSession>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -2268,26 +2211,18 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
-    pub fn set_chat_session_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
+    pub fn set_chat_session_autonomy(&self, id: &str, autonomy: Autonomy) -> Result<()> {
         self.conn.execute(
-            "UPDATE chat_sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, goal, now_ms()],
+            "UPDATE chat_sessions SET autonomy = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, autonomy.id(), now_ms()],
         )?;
         Ok(())
     }
 
-    pub fn finish_chat_auto_resume_pending(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        reason: &str,
-    ) -> Result<()> {
+    pub fn set_chat_session_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE chat_auto_resume_pending
-             SET state = 'done', finish_reason = ?3, finished_at = ?4, updated_at = ?4,
-                 claim_token = NULL
-             WHERE session_id = ?1 AND turn_id = ?2",
-            params![session_id, turn_id, reason, now_ms()],
+            "UPDATE chat_sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, goal, now_ms()],
         )?;
         Ok(())
     }
@@ -2901,6 +2836,8 @@ impl Store {
     /// On server startup no in-flight task survives. Convert unfinished rows
     /// into explicit, user-recoverable terminal states without replaying them.
     pub fn reconcile_unfinished_chat_turns(&self) -> Result<Vec<StoredChatTurn>> {
+        // Sub-agent usage outliving its parent turn: its native connection died with the server.
+        self.finalize_usage_turns("codex-late:", "cancelled")?;
         self.reconcile_unfinished_chat_turns_inner(true)
     }
 
@@ -3180,15 +3117,6 @@ pub struct SshHostTest {
     pub tested_at: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct ChatAutoResumePending {
-    pub session_id: String,
-    pub turn_id: String,
-    pub recovery_action: String,
-    pub reset_at_ms: Option<i64>,
-    pub state: String,
-}
-
 /// One chat thread with a harness. `native_session_id` is the harness's own
 /// session/rollout id (set after the first turn for CLIs that mint it lazily).
 #[derive(Debug, Clone)]
@@ -3227,14 +3155,17 @@ pub struct StoredChatSession {
     /// What the user asked the agent to keep working toward (`/goal`), carried
     /// into every turn until they clear it.
     pub goal: Option<String>,
+    /// Research autonomy level id (`crate::local::autonomy`); `None` is the default.
+    pub autonomy: Option<String>,
     /// Tip of the branch the UI is currently showing. Forked turns make the
     /// transcript a tree; this picks which path through it is live.
     pub active_leaf_id: Option<String>,
     /// Session that spawned this one with `orx agent spawn`. `None` for
     /// sessions the user started from the dashboard.
     pub parent_session_id: Option<String>,
-    /// When true, exhausted 5h quota failures wait for reset then recover.
-    pub auto_resume: bool,
+    /// Chat this side chat branched from. Side chats share that chat's
+    /// worktree, stay out of history, and are deleted with it.
+    pub side_parent_session_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -3256,6 +3187,7 @@ pub struct StoredUiState {
     pub tour_completed: bool,
     pub preferred_agent: Option<StoredAgentSelection>,
     pub workspace: Option<GlobalWorkspaceState>,
+    pub preferred_autonomy: Option<Autonomy>,
 }
 
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
@@ -3383,7 +3315,7 @@ fn row_to_chat_turn(
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, parent_session_id, \
-     auto_resume, goal";
+     goal, autonomy, side_parent_session_id";
 
 fn row_to_chat_spawn(row: &rusqlite::Row<'_>) -> std::result::Result<ChatSpawn, rusqlite::Error> {
     Ok(ChatSpawn {
@@ -3419,8 +3351,9 @@ fn row_to_chat_session(
         bootstrap_context: row.get(16)?,
         active_leaf_id: row.get(17)?,
         parent_session_id: row.get(18)?,
-        auto_resume: row.get::<_, i64>(19).map(|v| v != 0).unwrap_or(false),
-        goal: row.get(20)?,
+        goal: row.get(19)?,
+        autonomy: row.get(20)?,
+        side_parent_session_id: row.get(21)?,
     })
 }
 
@@ -3662,6 +3595,7 @@ mod tests {
                 tour_completed: false,
                 preferred_agent: None,
                 workspace: None,
+                preferred_autonomy: None,
             }
         );
 
@@ -3675,6 +3609,7 @@ mod tests {
         store.set_onboarding_completed(true).unwrap();
         store.set_tour_completed(true).unwrap();
         store.set_preferred_agent(&selection).unwrap();
+        store.set_preferred_autonomy(Autonomy::Copilot).unwrap();
 
         assert_eq!(
             store.ui_state().unwrap(),
@@ -3683,6 +3618,7 @@ mod tests {
                 tour_completed: true,
                 preferred_agent: Some(selection),
                 workspace: None,
+                preferred_autonomy: Some(Autonomy::Copilot),
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4504,9 +4440,10 @@ mod tests {
             context_usage_json: None,
             bootstrap_context: None,
             goal: None,
+            autonomy: None,
             active_leaf_id: None,
             parent_session_id: None,
-            auto_resume: false,
+            side_parent_session_id: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -4521,6 +4458,22 @@ mod tests {
             attempts: 0,
             finished_at: None,
         }
+    }
+
+    #[test]
+    fn chat_session_autonomy_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("orx-store-autonomy-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut session = chat_session_fixture("chat_a");
+        session.autonomy = Some("copilot".into());
+        store.create_chat_session(&session).unwrap();
+        let autonomy = |store: &Store| store.get_chat_session("chat_a").unwrap().unwrap().autonomy;
+        assert_eq!(autonomy(&store).as_deref(), Some("copilot"));
+        store
+            .set_chat_session_autonomy("chat_a", Autonomy::Agentic)
+            .unwrap();
+        assert_eq!(autonomy(&store).as_deref(), Some("agentic"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4550,6 +4503,38 @@ mod tests {
                 .as_deref(),
             Some("chat_parent")
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn side_chats_stay_out_of_history_and_share_their_parents_worktree() {
+        let dir = std::env::temp_dir().join(format!("orx-store-sidechat-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat_parent"))
+            .unwrap();
+        let mut side = chat_session_fixture("chat_side");
+        side.side_parent_session_id = Some("chat_parent".into());
+        store.create_chat_session(&side).unwrap();
+
+        let all: Vec<String> = store
+            .list_all_chat_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(all, ["chat_parent"]);
+        assert_eq!(store.side_chats_of("chat_parent").unwrap(), ["chat_side"]);
+        assert_eq!(store.side_chat_ids().unwrap(), ["chat_side"]);
+        assert_eq!(
+            store.chat_worktree_owner("chat_side").unwrap(),
+            "chat_parent"
+        );
+        assert_eq!(store.chat_worktree_owner("chat_gone").unwrap(), "chat_gone");
+        // An orphan whose parent row is gone owns its own worktree again.
+        store.delete_chat_session("chat_parent").unwrap();
+        assert_eq!(store.chat_worktree_owner("chat_side").unwrap(), "chat_side");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -677,7 +677,6 @@ mod tests {
             agent_ready: false,
             agent_note: None,
             needs_config_repair: false,
-            supports_five_hour_quota_probe: false,
             supports_steering: false,
             catalog_pending: false,
             models: Vec::new(),

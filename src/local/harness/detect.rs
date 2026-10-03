@@ -262,8 +262,6 @@ pub struct HarnessInfo {
     /// Whether a running turn accepts further user input, which is what lets
     /// the composer steer instead of parking the message until the turn ends.
     pub supports_steering: bool,
-    /// Whether this harness can probe the rolling ~5h usage quota for auto-resume.
-    pub supports_five_hour_quota_probe: bool,
     /// Set when a snapshot detection answered from file/discovery evidence
     /// and deferred the expensive probes — model catalog, live auth,
     /// capability checks — to a background full pass that replaces the
@@ -299,7 +297,6 @@ impl HarnessInfo {
             agent_note: None,
             needs_config_repair: false,
             supports_steering: false,
-            supports_five_hour_quota_probe: false,
             catalog_pending: false,
             models: Vec::new(),
             options: super::HarnessOptions::none(),

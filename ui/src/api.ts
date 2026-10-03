@@ -222,7 +222,12 @@ export interface UiState {
   onboardingCompleted: boolean;
   tourCompleted: boolean;
   preferredAgent: AgentSelection | null;
+  preferredAutonomy: Autonomy | null;
 }
+
+/** How much of the research the agent owns before checking in. */
+export type Autonomy = "copilot" | "agentic";
+export const DEFAULT_AUTONOMY: Autonomy = "agentic";
 
 export const getUiState = (signal?: AbortSignal) => get<UiState>("/api/settings/ui-state", signal);
 
@@ -238,6 +243,7 @@ export const updateUiState = (body: {
   workspace?: GlobalWorkspace;
   tourCompleted?: boolean;
   preferredAgent?: AgentSelection;
+  preferredAutonomy?: Autonomy;
 }) => post<UiState>("/api/settings/ui-state", body);
 
 export const completeOnboarding = (selection: OnboardingSelection, profile: Profile) =>
@@ -1694,8 +1700,6 @@ export interface Harness {
   /** A running turn takes further input, so the composer steers instead of
    * queueing. Narrowed per installation (codex's legacy exec path can't). */
   supportsSteering: boolean;
-  /** Capability: harness can probe the rolling ~5h usage window. */
-  supportsFiveHourQuotaProbe: boolean;
   /** A snapshot answer whose model catalog is still filling in the
    * background — `models` stays empty until `harness.catalog`
    * arrives and a plain re-read swaps in the real list. */
@@ -1914,14 +1918,16 @@ export interface ChatSession {
   planMode: boolean;
   /** What `/goal` asked the agent to keep working toward; null when unset. */
   goal?: string | null;
+  autonomy: Autonomy;
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
   archived: boolean;
   /** Session whose agent spawned this one with `orx agent spawn`; null for
    * sessions the user started themselves. */
   parentSessionId?: string | null;
-  /** Wait outside the model for 5h quota reset, then continue/retry. Default off. */
-  autoResume: boolean;
+  /** Chat this side chat branched from. Side chats share its worktree and
+   * stay out of history; closing the tab deletes one. */
+  sideParentSessionId?: string | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
@@ -1972,7 +1978,7 @@ export interface TurnOptions {
 export const createChatSession = (
   projectId: string,
   harness: HarnessId,
-  opts: TurnOptions = {},
+  opts: TurnOptions & { autonomy?: Autonomy } = {},
 ) =>
   post<{ session: ChatSession }>("/api/chat/sessions", { projectId, harness, ...opts }).then(
     (r) => r.session,
@@ -2001,19 +2007,25 @@ export const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
     (r) => r.session,
   );
 
+/** Branch a temporary side chat off a snapshot of `sessionId`'s transcript. */
+export const openSideChat = (sessionId: string) =>
+  post<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}/side`, {}).then(
+    (r) => r.session,
+  );
+
 /** `null` clears the goal. */
 export const setChatSessionGoal = (sessionId: string, goal: string | null) =>
   patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal }).then(
     (r) => r.session,
   );
 
-export const setChatSessionPermissionMode = (sessionId: string, permissionMode: string) =>
-  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { permissionMode }).then(
+export const setChatSessionAutonomy = (sessionId: string, autonomy: Autonomy) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { autonomy }).then(
     (r) => r.session,
   );
 
-export const setChatSessionAutoResume = (sessionId: string, autoResume: boolean) =>
-  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { autoResume }).then(
+export const setChatSessionPermissionMode = (sessionId: string, permissionMode: string) =>
+  patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { permissionMode }).then(
     (r) => r.session,
   );
 

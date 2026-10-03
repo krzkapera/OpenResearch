@@ -509,10 +509,9 @@ fn has_api_credential() -> bool {
 /// the throwaway request unrecorded.
 ///
 /// `--model haiku`/`sonnet` are CLI model aliases of the kind we already pass
-/// through from the catalog; a CLI too old to know them exits non-zero, which
-/// lands on `None`. Every other failure (spawn, timeout, garbage output)
-/// degrades the same silent way.
-async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+/// through from the catalog; a CLI too old to know them exits non-zero, and
+/// the error carries what it printed.
+async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let model = match request.quality {
         OneShotQuality::Cheap => "haiku",
         OneShotQuality::Standard => "sonnet",
@@ -543,7 +542,7 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped())
     .kill_on_drop(true)
     // Hermetic: run outside any repo so the child doesn't ingest the server
     // cwd's CLAUDE.md / settings into a request that carries its own context.
@@ -551,7 +550,7 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     prepare_env(&mut cmd);
     cmd.env(
         "CLAUDE_CONFIG_DIR",
-        native_store::prepare_claude(NativeStore::Isolated).ok()?,
+        native_store::prepare_claude(NativeStore::Isolated)?,
     );
     cmd.env(
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
@@ -563,12 +562,15 @@ async fn claude_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     let fut = cmd.output();
     let out = tokio::time::timeout(request.timeout, fut)
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| anyhow!("timed out after {}s", request.timeout.as_secs()))??;
     if !out.status.success() {
-        return None;
+        // `-p` prints request failures (bad model, signed out) on stdout; stderr is diagnostics.
+        return Err(super::one_shot_exit_error(
+            out.status,
+            &[&out.stdout, &out.stderr],
+        ));
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// `claude` on PATH, then the common install drop locations, in preference order.
@@ -741,14 +743,6 @@ impl Harness for ClaudeCode {
         true
     }
 
-    fn supports_five_hour_quota_probe(&self) -> bool {
-        true
-    }
-
-    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
-        probe_claude_five_hour_quota().await
-    }
-
     /// Claude compacts in place through its own `/compact`, keeping the session
     /// id. Without a live child there is nothing to compact against, so the
     /// shared fallback runs instead.
@@ -791,8 +785,9 @@ impl Harness for ClaudeCode {
             .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        claude_one_shot(&find_claude()?, request).await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let bin = find_claude().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
+        claude_one_shot(&bin, request).await
     }
 
     fn one_shot_honours_model(&self) -> bool {
@@ -1507,6 +1502,10 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             let inner = event.get("event").unwrap_or(&Value::Null);
             match inner.get("type").and_then(Value::as_str) {
                 Some("message_start") => {
+                    // An interrupt kills the child before `assistant`; the model is known here.
+                    if let Some(message) = inner.get("message") {
+                        record_message(ctx, message);
+                    }
                     // Sub-agent streams have their own message ids; namespace the
                     // stream mid per parent so a concurrent sub-agent's deltas
                     // don't collide with the main stream's.
@@ -1648,28 +1647,8 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
             if let Some(message) = event.get("message") {
                 ctx.record_native_invocations(message);
             }
-            if let (Some(sample_id), Some(model), Some(usage)) = (
-                event.pointer("/message/id").and_then(Value::as_str),
-                event.pointer("/message/model").and_then(Value::as_str),
-                event.pointer("/message/usage"),
-            ) {
-                let field = |key| usage.get(key).and_then(Value::as_u64);
-                let input_tokens = field("input_tokens")
-                    .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
-                    .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?));
-                ctx.record_native_usage(
-                    &format!("claude-{}:{sample_id}", ctx.attempt_count_for_usage()),
-                    Some(model),
-                    None,
-                    crate::store::TokenUsage {
-                        input_tokens,
-                        // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
-                        output_tokens: field("output_tokens"),
-                        cache_read_tokens: field("cache_read_input_tokens"),
-                        cache_write_tokens: field("cache_creation_input_tokens"),
-                        reasoning_tokens: None,
-                    },
-                );
+            if let Some(message) = event.get("message") {
+                record_message(ctx, message);
             }
             if event
                 .get("error")
@@ -1955,6 +1934,40 @@ fn mark_stream_final(ctx: &mut TurnCtx, state: &TurnState) {
         let prefix = format!("{mid}-");
         ctx.mark_final_text(|part| part.id.starts_with(&prefix));
     }
+}
+
+/// One native message's model and usage snapshot, recorded even when only one is reported.
+fn record_message(ctx: &TurnCtx, message: &Value) {
+    let (Some(id), model, usage) = (
+        message.get("id").and_then(Value::as_str),
+        message.get("model").and_then(Value::as_str),
+        message.get("usage"),
+    ) else {
+        return;
+    };
+    if model.is_none() && usage.is_none() {
+        return;
+    }
+    let field = |key| {
+        usage
+            .and_then(|usage| usage.get(key))
+            .and_then(Value::as_u64)
+    };
+    ctx.record_native_usage(
+        &format!("claude-{}:{id}", ctx.attempt_count_for_usage()),
+        model,
+        None,
+        crate::store::TokenUsage {
+            input_tokens: field("input_tokens")
+                .and_then(|input| input.checked_add(field("cache_read_input_tokens")?))
+                .and_then(|input| input.checked_add(field("cache_creation_input_tokens")?)),
+            // Assistant output is a partial subtotal; terminal modelUsage includes reasoning.
+            output_tokens: field("output_tokens"),
+            cache_read_tokens: field("cache_read_input_tokens"),
+            cache_write_tokens: field("cache_creation_input_tokens"),
+            reasoning_tokens: None,
+        },
+    );
 }
 
 fn claude_result_usage_samples(
@@ -2442,43 +2455,6 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     }
     let _ = ctx.flush();
     Ok(())
-}
-
-async fn probe_claude_five_hour_quota() -> crate::local::harness::QuotaProbeResult {
-    use crate::local::harness::quota::{parse_claude_usage_text, QuotaProbeResult};
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.args(["-p", "/usage", "--output-format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output()).await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            return QuotaProbeResult::Unknown {
-                detail: format!("claude spawn failed: {err}"),
-            };
-        }
-        Err(_) => {
-            return QuotaProbeResult::Unknown {
-                detail: "claude /usage timed out".into(),
-            };
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = if stdout.trim().is_empty() {
-        stderr.as_ref()
-    } else {
-        stdout.as_ref()
-    };
-    if text.trim().is_empty() {
-        return QuotaProbeResult::Unknown {
-            detail: "claude /usage returned empty output".into(),
-        };
-    }
-    parse_claude_usage_text(text)
 }
 
 #[cfg(test)]

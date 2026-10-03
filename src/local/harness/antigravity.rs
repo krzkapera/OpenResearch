@@ -119,14 +119,6 @@ impl Harness for Antigravity {
         true
     }
 
-    fn supports_five_hour_quota_probe(&self) -> bool {
-        true
-    }
-
-    async fn probe_five_hour_quota(&self) -> crate::local::harness::QuotaProbeResult {
-        probe_agy_five_hour_quota().await
-    }
-
     async fn detect(&self) -> Option<HarnessInfo> {
         self.detect_at(false).await
     }
@@ -205,8 +197,9 @@ impl Harness for Antigravity {
         })
     }
 
-    async fn one_shot(&self, request: OneShot<'_>) -> Option<String> {
-        agy_one_shot(&find_agy()?, request).await
+    async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
+        let bin = find_agy().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
+        agy_one_shot(&bin, request).await
     }
 
     fn config_home(&self) -> Option<PathBuf> {
@@ -321,7 +314,7 @@ fn parse_agy_model_list(text: &str) -> Vec<ModelInfo> {
         .collect()
 }
 
-async fn agy_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
+async fn agy_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
     let message = if request.system.is_empty() {
         request.prompt.to_string()
     } else {
@@ -353,70 +346,15 @@ async fn agy_one_shot(bin: &Path, request: OneShot<'_>) -> Option<String> {
     cmd.env("NO_COLOR", "1");
     let out = tokio::time::timeout(request.timeout, cmd.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| anyhow!("Antigravity one-shot timed out"))??;
     if !out.status.success() {
-        return None;
+        return Err(anyhow!("Antigravity one-shot failed ({})", out.status));
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-/// Probe the rolling ~5h usage window agy reports, for auto-resume. Prefers
-/// JSON (same flags as the Claude probe); falls back to the tabular output
-/// `scripts/quota/agy-limits.sh` also reads, since not every agy build
-/// supports `--output-format json` on `/usage`.
-async fn probe_agy_five_hour_quota() -> crate::local::harness::QuotaProbeResult {
-    use crate::local::harness::quota::{parse_agy_usage_text, QuotaProbeResult};
-
-    async fn run_agy_usage(extra_json: bool) -> Result<String, String> {
-        let mut cmd = Command::new("agy");
-        if extra_json {
-            cmd.args(["-p", "/usage", "--output-format", "json"]);
-        } else {
-            cmd.args(["-p", "/usage"]);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let output = match tokio::time::timeout(Duration::from_secs(45), cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => return Err(format!("agy spawn failed: {err}")),
-            Err(_) => return Err("agy /usage timed out".into()),
-        };
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let text = if stdout.trim().is_empty() {
-            stderr.to_string()
-        } else {
-            stdout.to_string()
-        };
-        if text.trim().is_empty() {
-            Err("agy /usage returned empty output".into())
-        } else {
-            Ok(text)
-        }
+    if text.is_empty() {
+        return Err(anyhow!("Antigravity one-shot returned no text"));
     }
-
-    let text = match run_agy_usage(true).await {
-        Ok(t) => {
-            let parsed = parse_agy_usage_text(&t);
-            if matches!(parsed, QuotaProbeResult::Unknown { .. }) {
-                match run_agy_usage(false).await {
-                    Ok(t2) => t2,
-                    Err(_) => t,
-                }
-            } else {
-                return parsed;
-            }
-        }
-        Err(_) => match run_agy_usage(false).await {
-            Ok(t) => t,
-            Err(detail) => return QuotaProbeResult::Unknown { detail },
-        },
-    };
-    parse_agy_usage_text(&text)
+    Ok(text)
 }
 
 fn first_turn_prompt(text: &str) -> String {
@@ -494,6 +432,9 @@ async fn run_turn(ctx: &mut TurnCtx) -> Result<()> {
     cmd.env("NO_COLOR", "1");
     set_chat_session_env(&mut cmd, &ctx.session_id, "antigravity", Some(up_port));
     cmd.env("ORX_SESSION_ID", &ctx.session_id);
+    if let Some(execution) = ctx.usage_execution_id() {
+        cmd.env("ORX_USAGE_EXECUTION_ID", execution);
+    }
     cmd.env(
         "ORX_GATE_TOKEN",
         ctx.host
@@ -674,7 +615,7 @@ Stop-TurnProcess ([uint32] $env:ORX_STOP_PID)
 
 fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
     std::fs::create_dir_all(repo)?;
-    let tracked = std::process::Command::new("git")
+    let tracked = crate::local::git::git_command()
         .args(["ls-files", "--error-unmatch", ".agents/hooks.json"])
         .current_dir(repo)
         .stdout(Stdio::null())
@@ -710,11 +651,12 @@ fn write_approval_hook(repo: &Path, enabled: bool) -> Result<()> {
         // prepare_env puts this executable's directory first on PATH.
         "orx antigravity-gate".to_string()
     };
+    // Without approval the gate still sees shell commands, to export their invoking model.
     object.insert(
         "openresearch-approval".into(),
         serde_json::json!({
-            "enabled": enabled,
-            "PreToolUse": [{"matcher":"*","hooks":[{"type":"command","command":command,"timeout":3600}]}]
+            "enabled": enabled || !cfg!(windows),
+            "PreToolUse": [{"matcher": if enabled { "*" } else { "run_command" },"hooks":[{"type":"command","command":command,"timeout":3600}]}]
         }),
     );
     object.insert(
@@ -842,20 +784,20 @@ fn apply_event(ctx: &mut TurnCtx, state: &mut TurnState, event: &Value) -> bool 
         }
         "step_update" => {
             if let Some(step) = event.get("step_update") {
-                if let Some(cid) = step
+                // A forwarded sub-agent step names its own conversation; only the first is the root.
+                let own = step
                     .get("conversation_id")
                     .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                {
-                    state.conversation_id = Some(cid.to_string());
+                    .filter(|id| !id.is_empty());
+                if state.conversation_id.is_none() {
+                    state.conversation_id = own.map(str::to_string);
                 }
                 if let (Some(index), Some(usage)) = (
                     step.get("step_index").and_then(Value::as_i64),
                     antigravity_step_usage(step),
                 ) {
-                    let sample_id = state
-                        .conversation_id
-                        .as_deref()
+                    let sample_id = own
+                        .or(state.conversation_id.as_deref())
                         .map(|conversation| invocation_sample_id(conversation, index))
                         .unwrap_or_else(|| {
                             format!("antigravity-{}:{index}", ctx.attempt_count_for_usage())
@@ -1301,7 +1243,11 @@ mod tests {
         let path = repo.join(".agents/hooks.json");
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(content["openresearch-approval"]["enabled"], false);
+        assert_eq!(content["openresearch-approval"]["enabled"], !cfg!(windows));
+        assert_eq!(
+            content["openresearch-approval"]["PreToolUse"][0]["matcher"],
+            "run_command"
+        );
         assert_eq!(content["openresearch-accounting"]["enabled"], true);
         assert_eq!(
             content["openresearch-accounting"]["PostInvocation"]
