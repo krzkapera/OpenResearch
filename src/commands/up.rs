@@ -6278,6 +6278,20 @@ async fn remove_local_model(State(state): State<AppState>, Path(id): Path<String
 
 const HARNESS_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// `HARNESS_CACHE_TTL`, overridable with `ORX_HARNESS_CACHE_TTL_SECS`: on a small
+/// box every expired read buys a full sweep (one child per harness probe), so an
+/// operator may keep the entry until an explicit `GET /api/harnesses?refresh=1`.
+fn harness_cache_ttl() -> Duration {
+    static TTL: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        std::env::var("ORX_HARNESS_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(HARNESS_CACHE_TTL)
+    });
+    *TTL
+}
+
 /// Minimum age before a still-pending or promotion-blocked entry may re-arm a
 /// catalog fill — bounds how often a non-converging state can buy a sweep.
 const FILL_RETRY_FLOOR: Duration = Duration::from_secs(5);
@@ -6597,7 +6611,7 @@ async fn harnesses_payload(state: &AppState, q: &HarnessQuery) -> Value {
         // converge (e.g. Ready auth over a broken install) must not buy a
         // full sweep on every read.
         let wants_fill = payload_is_provisional(payload) || promotable;
-        if at.elapsed() >= HARNESS_CACHE_TTL || (wants_fill && at.elapsed() >= FILL_RETRY_FLOOR) {
+        if at.elapsed() >= harness_cache_ttl() || (wants_fill && at.elapsed() >= FILL_RETRY_FLOOR) {
             spawn_catalog_fill(state.clone(), *at, uuid::Uuid::new_v4());
         }
         let mut out = payload.clone();
