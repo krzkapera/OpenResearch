@@ -30,7 +30,7 @@ use crate::store::{now_ms, ChatSpawn, Store, StoredChatSession};
 use crate::AgentCommand;
 
 /// Helpers one session may have in flight at once.
-pub(crate) const MAX_LIVE_SPAWNS: i64 = 5;
+pub(crate) const MAX_LIVE_SPAWNS: i64 = 20;
 
 pub async fn run(args: crate::AgentArgs) -> Result<()> {
     let store = Store::open()?;
