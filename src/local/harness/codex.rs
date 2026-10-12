@@ -3022,13 +3022,12 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
             }
             TurnEvent::Request { id, method, params } => {
                 let kind = crate::local::codex::server_req_kind(&method);
-                if event_turn_mismatch(turn_id.as_deref(), &params) {
-                    // A stale turn's request (aborted predecessor still
-                    // streaming) is settled, never surfaced — with the reply
-                    // shape its method can actually parse.
-                    settle_request(&client, &id, kind).await;
-                } else {
-                    match kind {
+                match route_request(
+                    event_turn_mismatch(turn_id.as_deref(), &params),
+                    ctx.spawned_helper,
+                ) {
+                    RequestRoute::SettleNow => settle_request(&client, &id, kind).await,
+                    RequestRoute::Card => match kind {
                         ServerReqKind::Approval => {
                             let card = approval_card(turn_id.as_deref(), &method, &id, &params);
                             if let Some((part_id, part)) = card {
@@ -3083,7 +3082,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                             // rather than answer in a shape codex can't parse.
                             let _ = client.respond_method_unsupported(&id).await;
                         }
-                    }
+                    },
                 }
             }
             TurnEvent::Closed => {
@@ -3118,6 +3117,30 @@ async fn sweep_open_requests(
     for (part_id, (rpc_id, kind)) in open.drain() {
         resolve_card(ctx, &part_id);
         settle_request(client, &rpc_id, kind).await;
+    }
+}
+
+/// How a server→client request gets answered.
+enum RequestRoute {
+    /// Hold the request behind a card for a user to answer — only possible
+    /// on an interactive session's own turn.
+    Card,
+    /// Reply to codex right away in the request's own schema.
+    SettleNow,
+}
+
+/// Route a request: a stale turn's request (aborted predecessor still
+/// streaming) always settles, never surfaces. So does every request on a
+/// spawned-helper turn — a helper has no user to answer a card, and an
+/// unanswered request idles until codex's own approval deadline (minutes),
+/// by which point the model has already stopped reasoning and the turn
+/// "finishes" having done nothing (OR-476). Only an interactive session's
+/// own-turn request is worth a card.
+fn route_request(turn_mismatch: bool, spawned_helper: bool) -> RequestRoute {
+    if turn_mismatch || spawned_helper {
+        RequestRoute::SettleNow
+    } else {
+        RequestRoute::Card
     }
 }
 
@@ -5232,6 +5255,32 @@ requires_openai_auth = false
 
         assert_eq!(approval_decision(true), "accept");
         assert_eq!(approval_decision(false), "decline");
+    }
+
+    /// The card/settle routing for server→client requests. OR-476: a helper
+    /// turn's request surfaced a card nobody could answer, and the turn hung
+    /// until codex's own approval deadline — the helper "finished" having
+    /// written only its preamble. Every request on a spawned-helper turn must
+    /// take the immediate-settle path (approval → decline, userInput → empty
+    /// answers, other → method-not-found); only an interactive session's own
+    /// turn gets a card.
+    #[test]
+    fn request_routing_settles_helper_and_stale_turns_immediately() {
+        // An interactive session's own turn is the only case with a user who
+        // could answer: card it.
+        assert!(matches!(route_request(false, false), RequestRoute::Card));
+        // Spawned helper — no user exists, so settle right away whatever the
+        // request kind (routing doesn't depend on kind).
+        assert!(matches!(
+            route_request(false, true),
+            RequestRoute::SettleNow
+        ));
+        // A stale turn's request settles too — its card's turn is gone.
+        assert!(matches!(
+            route_request(true, false),
+            RequestRoute::SettleNow
+        ));
+        assert!(matches!(route_request(true, true), RequestRoute::SettleNow));
     }
 
     /// Part ids are turn-scoped: codex request ids restart at 0 per child

@@ -7022,6 +7022,9 @@ pub struct TurnCtx {
     orx_retry_count: u32,
     terminal_error: Option<(String, String)>,
     pub session_id: String,
+    /// Set on every turn of a session started by `orx agent spawn` (from #599; used by
+    /// the codex request routing of #634 only — the fork keeps its own spawn behaviour).
+    pub spawned_helper: bool,
     pub harness: String,
     pub native_session_id: Option<String>,
     pub model: Option<String>,
@@ -7080,6 +7083,7 @@ fn turn_ctx_from_stored(
         orx_retry_count: 0,
         terminal_error: None,
         session_id: session.id.clone(),
+        spawned_helper: session.parent_session_id.is_some(),
         harness: session.harness.clone(),
         native_session_id: session.native_session_id.clone(),
         model: session.model.clone(),
@@ -7468,6 +7472,7 @@ impl TurnCtx {
             orx_retry_count: 0,
             terminal_error: None,
             session_id: "test-session".into(),
+            spawned_helper: false,
             harness: "test".into(),
             native_session_id: None,
             model: None,
