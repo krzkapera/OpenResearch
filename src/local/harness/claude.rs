@@ -73,6 +73,7 @@ pub(crate) struct AuthProbe {
     pub state: HarnessAuthState,
     pub method: Option<&'static str>,
     pub provider: Option<String>,
+    subscription_type: Option<String>,
     pub sequence: u64,
     pub failed_check: bool,
     reported_method_present: bool,
@@ -97,6 +98,7 @@ impl AuthProbe {
             state: HarnessAuthState::Unknown,
             method: None,
             provider: None,
+            subscription_type: None,
             sequence,
             failed_check: true,
             reported_method_present: false,
@@ -162,6 +164,9 @@ pub(crate) fn parse_auth_status(exit_code: Option<i32>, stdout: &[u8], sequence:
                         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
             })
             .map(str::to_string),
+        subscription_type: value
+            .as_ref()
+            .and_then(|value| nonempty_str(value, "subscriptionType")),
         sequence,
         failed_check: state == HarnessAuthState::Unknown,
         reported_method_present: reported_method.is_some(),
@@ -502,6 +507,26 @@ fn has_api_credential() -> bool {
         .any(|key| super::detect::api_key(key).is_some())
 }
 
+/// Turn Claude's private billing enum into a stable user-facing label. Unknown
+/// values are deliberately hidden: exposing a new server-side enum verbatim is
+/// both confusing and makes the dashboard depend on an undocumented contract.
+fn billing_label(
+    subscription: Option<&str>,
+    tier: Option<&str>,
+    value: Option<&str>,
+) -> Option<String> {
+    match (subscription, tier, value) {
+        (Some("max") | None, Some("default_claude_max_5x"), _) => Some("Max 5x".into()),
+        (Some("max") | None, Some("default_claude_max_20x"), _) => Some("Max 20x".into()),
+        (Some("max"), _, _) => Some("Max".into()),
+        (Some("pro"), _, _) => Some("Pro".into()),
+        (_, _, Some("stripe_subscription" | "stripe_subscription_contracted")) => {
+            Some("Subscription".to_string())
+        }
+        _ => None,
+    }
+}
+
 /// One headless request on a throwaway `claude -p` child, mirroring how
 /// Claude Code titles its own conversations with a cheap background model.
 /// Deliberately *not* the session's resident child — a request there would
@@ -663,17 +688,40 @@ impl ClaudeCode {
             if info.auth_state == HarnessAuthState::Ready {
                 info.authenticated = true;
                 if probe.method == Some("oauth") {
+                    let credential_tier = if cfg!(target_os = "macos") {
+                        None
+                    } else {
+                        read_json(
+                            native_store::claude_home(NativeStore::Legacy)
+                                .join(".credentials.json"),
+                        )
+                        .and_then(|credentials| {
+                            credentials
+                                .get("claudeAiOauth")
+                                .and_then(|oauth| nonempty_str(oauth, "rateLimitTier"))
+                        })
+                    };
+                    info.plan = billing_label(
+                        probe.subscription_type.as_deref(),
+                        credential_tier.as_deref(),
+                        None,
+                    );
                     if let Some(acct) = dirs::home_dir()
                         .and_then(|h| read_json(h.join(".claude.json")))
                         .and_then(|cfg| cfg.get("oauthAccount").cloned())
                     {
                         info.account = nonempty_str(&acct, "emailAddress");
+                        info.account_name = nonempty_str(&acct, "displayName")
+                            .or_else(|| nonempty_str(&acct, "fullName"));
                         info.org = nonempty_str(&acct, "organizationName");
-                        info.plan = match nonempty_str(&acct, "billingType").as_deref() {
-                            Some("stripe_subscription") => Some("Subscription".to_string()),
-                            Some(other) => Some(other.to_string()),
-                            None => None,
-                        };
+                        info.plan = billing_label(
+                            probe.subscription_type.as_deref(),
+                            credential_tier.as_deref().or_else(|| {
+                                acct.get("organizationRateLimitTier")
+                                    .and_then(Value::as_str)
+                            }),
+                            nonempty_str(&acct, "billingType").as_deref(),
+                        );
                     }
                 }
             }
@@ -2544,6 +2592,45 @@ mod tests {
         // No manifest at all is no plugins, not an error.
         assert!(installed_plugin_skills_dirs(&home.join("nope")).is_empty());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn billing_labels_hide_private_enums() {
+        let probe = parse_auth_status(
+            Some(0),
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"pro"}"#,
+            1,
+        );
+        assert_eq!(probe.subscription_type.as_deref(), Some("pro"));
+        assert_eq!(
+            billing_label(None, None, Some("stripe_subscription")),
+            Some("Subscription".to_string())
+        );
+        assert_eq!(
+            billing_label(None, None, Some("stripe_subscription_contracted")),
+            Some("Subscription".to_string())
+        );
+        assert_eq!(
+            billing_label(Some("pro"), None, None).as_deref(),
+            Some("Pro")
+        );
+        assert_eq!(
+            billing_label(Some("max"), Some("default_claude_max_5x"), None).as_deref(),
+            Some("Max 5x")
+        );
+        assert_eq!(
+            billing_label(Some("max"), Some("default_claude_max_20x"), None).as_deref(),
+            Some("Max 20x")
+        );
+        assert_eq!(
+            billing_label(Some("pro"), Some("default_claude_max_20x"), None).as_deref(),
+            Some("Pro")
+        );
+        assert_eq!(
+            billing_label(None, None, Some("future_internal_value")),
+            None
+        );
+        assert_eq!(billing_label(None, None, None), None);
     }
 
     /// A `list_models` response in the live 2.1.212 shape (fields we don't
