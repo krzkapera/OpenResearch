@@ -396,6 +396,10 @@ impl Harness for OpenCode {
 
     /// opencode compacts through its own summarize endpoint, which needs a live
     /// server and a native session; without either, the shared fallback runs.
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
     async fn compact(&self, ctx: &CompactCtx) -> Result<CompactOutcome> {
         let Some(native_id) = ctx.native_session_id.as_deref() else {
             return Ok(CompactOutcome::Fallback);

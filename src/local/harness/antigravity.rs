@@ -127,6 +127,13 @@ impl Harness for Antigravity {
         self.detect_at(true).await
     }
 
+    /// Fork: agy keeps the shared summarize-and-reseed compaction it always
+    /// had (the trait's default `compact` → `Fallback`); #761's native agy
+    /// `/compact` is intentionally not ported.
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
     async fn run_turn(&self, ctx: &mut TurnCtx) -> TurnResult {
         run_turn(ctx)
             .await
