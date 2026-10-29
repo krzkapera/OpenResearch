@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::{anyhow, Result};
 use crate::local::agent_lifecycle::{IdlePolicy, REAPER_INTERVAL};
 use crate::local::harness::codex::{ensure_orx_data_dir, find_codex_required};
-use crate::local::native_store::{self, NativeStore};
+use crate::local::native_store::{self, CodexProfile, NativeStore};
 
 /// Ceiling on a request's response wait — generous because `thread/start`
 /// blocks on the user's own MCP servers coming up.
@@ -212,6 +212,8 @@ pub struct CodexClient {
     /// child (crash/restart replacement) — the DB signal covers that case.
     last_collab_mode: std::sync::Mutex<Option<&'static str>>,
     native_store: NativeStore,
+    /// Which Codex account (home) this child runs on — `codex` or `codex2`.
+    profile: CodexProfile,
     session_id: String,
     /// Each native (thread, turn)'s model, outliving any one orx turn: sub-agents do.
     turn_models: std::sync::Mutex<HashMap<(String, String), String>>,
@@ -432,6 +434,10 @@ impl CodexClient {
         self.native_store
     }
 
+    pub fn profile(&self) -> CodexProfile {
+        self.profile
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -627,6 +633,7 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
                 drop(turn);
                 if let Some(TurnEvent::Notification { method, params }) = unsent {
                     crate::local::harness::codex::record_unowned(
+                        client.profile.harness_id(),
                         &client.session_id,
                         &client.turn_models,
                         &method,
@@ -657,6 +664,7 @@ async fn read_loop(client: Arc<CodexClient>, stdout: tokio::process::ChildStdout
 fn spawn_client(
     session_id: &str,
     up_port: Option<u16>,
+    profile: CodexProfile,
     native_store: NativeStore,
     bin: PathBuf,
     codex_home: PathBuf,
@@ -668,14 +676,16 @@ fn spawn_client(
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(crate::local::chat::harness_log("codex")?))
+        .stderr(Stdio::from(crate::local::chat::harness_log(
+            profile.harness_id(),
+        )?))
         .kill_on_drop(true);
     crate::local::chat::prepare_env(&mut cmd);
     cmd.env("CODEX_HOME", codex_home);
     // Stamp the launching session (one app-server child per orx session) so a
     // run the agent starts via `orx exp run` is tagged with it and can be
     // explicitly subscribed to. After prepare_env so it isn't shadowed.
-    crate::local::chat::set_chat_session_env(&mut cmd, session_id, "codex", up_port);
+    crate::local::chat::set_chat_session_env(&mut cmd, session_id, profile.harness_id(), up_port);
     // Pin the child's store to the same canonicalized dir the sandbox policy
     // grants (see harness/codex.rs `ensure_orx_data_dir`) — after prepare_env
     // so the pin beats a dashboard-synced ORX_DATA_DIR. Unconditional: the
@@ -721,6 +731,7 @@ fn spawn_client(
         thread_model: std::sync::Mutex::new(None),
         last_collab_mode: std::sync::Mutex::new(None),
         native_store,
+        profile,
         session_id: session_id.to_string(),
         turn_models: std::sync::Mutex::new(HashMap::new()),
         last_active: std::sync::Mutex::new(Instant::now()),
@@ -796,23 +807,30 @@ impl CodexHost {
     /// the caller — `resumed_thread` starts empty on the replacement).
     ///
     /// Cancelled startup retires its child; the detached handoff owns cleanup.
+    ///
+    /// `profile` picks the Codex home (`codex` → `~/.codex`, `codex2` →
+    /// `~/.codex2`); the binary is the same for both. A live child of the
+    /// other profile is never reused for this session.
     pub async fn ensure(
         self: &Arc<Self>,
         session_id: &str,
+        profile: CodexProfile,
         native_store: NativeStore,
     ) -> Result<Arc<CodexClient>> {
         let host = self.clone();
         let session = session_id.to_string();
-        self.ensure_with_spawn(session_id, native_store, async move {
+        self.ensure_with_spawn_for(session_id, profile, native_store, async move {
             let bin = find_codex_required()?;
-            let codex_home =
-                tokio::task::spawn_blocking(move || native_store::prepare_codex(native_store))
-                    .await
-                    .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
+            let codex_home = tokio::task::spawn_blocking(move || {
+                native_store::prepare_codex_for(profile, native_store)
+            })
+            .await
+            .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
             Ok(move || {
                 spawn_client(
                     &session,
                     host.up_port.get().copied(),
+                    profile,
                     native_store,
                     bin,
                     codex_home,
@@ -822,6 +840,7 @@ impl CodexHost {
         .await
     }
 
+    #[cfg(test)]
     async fn ensure_with_spawn<F>(
         self: &Arc<Self>,
         session_id: &str,
@@ -831,9 +850,26 @@ impl CodexHost {
     where
         F: FnOnce() -> Result<Arc<CodexClient>> + Send + 'static,
     {
+        self.ensure_with_spawn_for(session_id, CodexProfile::Primary, native_store, prepare)
+            .await
+    }
+
+    async fn ensure_with_spawn_for<F>(
+        self: &Arc<Self>,
+        session_id: &str,
+        profile: CodexProfile,
+        native_store: NativeStore,
+        prepare: impl std::future::Future<Output = Result<F>>,
+    ) -> Result<Arc<CodexClient>>
+    where
+        F: FnOnce() -> Result<Arc<CodexClient>> + Send + 'static,
+    {
         {
             let _spawning = self.spawn_lock.lock().await;
-            if let Some(existing) = self.reusable_client(session_id, native_store).await {
+            if let Some(existing) = self
+                .reusable_client(session_id, profile, native_store)
+                .await
+            {
                 return Ok(existing);
             }
         }
@@ -848,7 +884,7 @@ impl CodexHost {
                 return;
             }
             // Another caller may have completed startup during preparation.
-            if let Some(existing) = host.reusable_client(&session, native_store).await {
+            if let Some(existing) = host.reusable_client(&session, profile, native_store).await {
                 let _ = ready_tx.send(Ok(existing));
                 return;
             }
@@ -904,11 +940,13 @@ impl CodexHost {
     async fn reusable_client(
         &self,
         session_id: &str,
+        profile: CodexProfile,
         native_store: NativeStore,
     ) -> Option<Arc<CodexClient>> {
         let guard = self.inner.lock().await;
         let client = guard.get(session_id)?;
         if client.native_store() == native_store
+            && client.profile() == profile
             && matches!(client.child.lock().await.try_wait(), Ok(None))
         {
             client.touch();
@@ -1127,6 +1165,7 @@ pub(crate) mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
+            profile: CodexProfile::Primary,
             session_id: String::new(),
             turn_models: std::sync::Mutex::new(HashMap::new()),
             last_active: std::sync::Mutex::new(last_active),
@@ -1184,6 +1223,53 @@ pub(crate) mod tests {
         host.kill_session("compact").await;
         assert!(Arc::ptr_eq(&ensured.unwrap().unwrap(), &client));
         assert!(Arc::ptr_eq(&reused.unwrap().unwrap(), &client));
+    }
+
+    /// A session's live `codex` child is never handed to a `codex2` turn (or
+    /// vice versa): the other account's home would answer it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_client_is_reused_only_for_its_own_codex_profile() {
+        let host = Arc::new(CodexHost::new());
+        let primary = rpc_test_client(
+            r#"IFS= read -r request; printf '%s\n' '{"id":1,"result":{}}'; sleep 600"#,
+        );
+        let spawned = primary.clone();
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            host.ensure_with_spawn_for("s", CodexProfile::Primary, NativeStore::Isolated, async {
+                Ok(move || Ok(spawned))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&first, &primary));
+        let reused = tokio::time::timeout(
+            Duration::from_secs(2),
+            host.ensure_with_spawn_for("s", CodexProfile::Primary, NativeStore::Isolated, async {
+                Ok(|| panic!("same profile must reuse"))
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&reused, &primary));
+        let other = tokio::time::timeout(
+            Duration::from_secs(2),
+            host.ensure_with_spawn_for(
+                "s",
+                CodexProfile::Secondary,
+                NativeStore::Isolated,
+                async {
+                    Err::<fn() -> Result<Arc<CodexClient>>, _>(anyhow!("codex2 spawn reached"))
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other.err().unwrap().to_string(), "codex2 spawn reached");
+        host.kill_session("s").await;
     }
 
     #[cfg(unix)]
@@ -1370,6 +1456,7 @@ pub(crate) mod tests {
             thread_model: std::sync::Mutex::new(None),
             last_collab_mode: std::sync::Mutex::new(None),
             native_store: NativeStore::Isolated,
+            profile: CodexProfile::Primary,
             session_id: String::new(),
             turn_models: std::sync::Mutex::new(HashMap::new()),
             last_active: std::sync::Mutex::new(Instant::now()),

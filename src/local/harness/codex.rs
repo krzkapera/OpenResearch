@@ -56,7 +56,7 @@ use crate::local::chat::{
     WirePart, WirePrompt, WireQuestionOption, WireToolState,
 };
 use crate::local::codex::{CodexClient, JsonRpcError, ServerReqKind, TurnEvent};
-use crate::local::native_store::{self, NativeStore};
+use crate::local::native_store::{self, CodexProfile, NativeStore};
 use crate::local::opencode::ensure_playbook;
 use crate::local::shell_env::find_on_path;
 use crate::store::{Store, StoredChatMessage};
@@ -179,12 +179,20 @@ fn capture_token_notification(
 
 /// Usage no live turn owns (a sub-agent outliving its parent's bounded drain, or reporting during
 /// a later turn) goes to that native turn's own execution, closed by its own `turn/completed`.
-pub(crate) fn record_unowned(session: &str, models: &TurnModels, method: &str, params: &Value) {
+/// `harness` is the session's Codex-family id (`codex` / `codex2`), the same id
+/// its owned turns record under, so a replayed total is recognised as counted.
+pub(crate) fn record_unowned(
+    harness: &str,
+    session: &str,
+    models: &TurnModels,
+    method: &str,
+    params: &Value,
+) {
     if !matches!(method, "thread/tokenUsage/updated" | "turn/completed") {
         return;
     }
-    if let Err(error) =
-        Store::open().and_then(|store| record_unowned_in(&store, session, models, method, params))
+    if let Err(error) = Store::open()
+        .and_then(|store| record_unowned_in(&store, harness, session, models, method, params))
     {
         eprintln!("orx up: could not record codex sub-agent usage: {error}");
     }
@@ -192,6 +200,7 @@ pub(crate) fn record_unowned(session: &str, models: &TurnModels, method: &str, p
 
 pub(crate) fn record_unowned_in(
     store: &Store,
+    harness: &str,
     session: &str,
     models: &TurnModels,
     method: &str,
@@ -217,14 +226,14 @@ pub(crate) fn record_unowned_in(
         return Ok(());
     };
     // A resumed thread replays its last turn's total, already counted by that turn.
-    if store.cumulative_counted("codex", usage.thread, usage.turn, &usage.total)? {
+    if store.cumulative_counted(harness, usage.thread, usage.turn, &usage.total)? {
         return Ok(());
     }
     let execution = execution(usage.thread, usage.turn);
-    store.begin_usage_execution(&execution, &execution, "codex")?;
+    store.begin_usage_execution(&execution, &execution, harness)?;
     store.record_cumulative_usage(
         &execution,
-        "codex",
+        harness,
         usage.thread,
         usage.turn,
         usage.model.as_deref(),
@@ -245,7 +254,8 @@ pub(crate) fn close_unowned(session: &str) {
 /// The invoking identity of a shell in `thread` (its `CODEX_THREAD_ID`): the model of the
 /// thread's running native turn.
 pub(crate) fn running_turn_identity(thread: &str) -> Option<crate::store::InvocationIdentity> {
-    let rollout = std::fs::read_to_string(native_store::codex_session(thread).ok()??.path).ok()?;
+    let rollout =
+        std::fs::read_to_string(native_store::codex_session_any(thread).ok()??.path).ok()?;
     running_turn_identity_in(&Store::open().ok()?, thread, &rollout)
 }
 
@@ -293,7 +303,8 @@ fn running_turn(rollout: &str) -> Option<(String, Option<String>)> {
 /// The model in `turn`'s `turn_context` record of `thread`'s rollout.
 fn rollout_turn_model(thread: &str, turn: &str) -> Option<String> {
     // ponytail: one blocking rollout read per (thread, turn); index it if rollouts grow huge.
-    let rollout = std::fs::read_to_string(native_store::codex_session(thread).ok()??.path).ok()?;
+    let rollout =
+        std::fs::read_to_string(native_store::codex_session_any(thread).ok()??.path).ok()?;
     turn_context_model(&rollout, turn)
 }
 
@@ -489,7 +500,39 @@ fn parse_model_list(result: &Value, configured_effort: Option<&str>) -> Vec<Mode
         .collect()
 }
 
-pub struct Codex;
+/// The Codex CLI harness. One type serves both Codex-family harnesses: the
+/// stock `codex` ([`Codex`], `~/.codex`) and the fork's `codex2` ([`Codex2`],
+/// a second account in `~/.codex2`). They share the binary and the model
+/// catalog; the home — login, plan, sessions, config, plugins — is per profile.
+pub struct Codex {
+    profile: CodexProfile,
+}
+
+/// The stock `codex` harness (primary account).
+#[allow(non_upper_case_globals)]
+pub const Codex: Codex = Codex {
+    profile: CodexProfile::Primary,
+};
+
+/// The fork's `codex2` harness (second account, separate `CODEX_HOME`).
+#[allow(non_upper_case_globals)]
+pub const Codex2: Codex = Codex {
+    profile: CodexProfile::Secondary,
+};
+
+impl Codex {
+    pub fn profile(&self) -> CodexProfile {
+        self.profile
+    }
+
+    /// The CLI line that signs this profile in.
+    fn login_hint(&self) -> &'static str {
+        match self.profile {
+            CodexProfile::Primary => "codex login",
+            CodexProfile::Secondary => "CODEX_HOME=~/.codex2 codex login",
+        }
+    }
+}
 
 /// Only the fields detection needs off `config.toml`; codex has many more.
 #[derive(Deserialize)]
@@ -608,7 +651,7 @@ pub(crate) fn find_codex_required() -> Result<PathBuf> {
 /// message.
 ///
 /// A failed turn's error event becomes the error; stderr is only Codex's own logging.
-async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
+async fn codex_one_shot(bin: &Path, profile: CodexProfile, request: OneShot<'_>) -> Result<String> {
     let effort = match request.quality {
         OneShotQuality::Cheap => "low",
         OneShotQuality::Standard => "medium",
@@ -638,7 +681,7 @@ async fn codex_one_shot(bin: &Path, request: OneShot<'_>) -> Result<String> {
         prepare_env(&mut cmd);
         cmd.env(
             "CODEX_HOME",
-            native_store::prepare_codex(NativeStore::Isolated)?,
+            native_store::prepare_codex_for(profile, NativeStore::Isolated)?,
         );
         // Plain text only — an ANSI-colorizing CLI (or a synced FORCE_COLOR)
         // would otherwise write escape codes straight into the reply.
@@ -726,11 +769,17 @@ impl Codex {
     /// app-server capability spawns — install is decided by discovery alone
     /// and auth is already a file read (`auth.json` / `config.toml`).
     async fn detect_at(&self, snapshot: bool) -> Option<HarnessInfo> {
+        // Each profile reads its own home: `codex2`'s login/plan come from
+        // `~/.codex2/auth.json`, never from `~/.codex`.
+        let home = native_store::codex_home_for(self.profile, NativeStore::Legacy);
+        self.detect_in(&home, snapshot).await
+    }
+
+    async fn detect_in(&self, home: &Path, snapshot: bool) -> Option<HarnessInfo> {
         let mut info = HarnessInfo::new(self.id(), self.name());
         // The config/auth file reads run before selection: they cost nothing
         // and their answer decides whether the app-server catalog child is
         // worth spawning at all.
-        let home = native_store::codex_home(NativeStore::Legacy);
         let config_raw = std::fs::read_to_string(home.join("config.toml")).ok();
         let custom_provider = config_raw.as_deref().and_then(parse_custom_provider);
         let configured_effort = config_raw.as_deref().and_then(parse_configured_effort);
@@ -865,12 +914,15 @@ impl Codex {
             // A configured custom provider already said which env var to set;
             // `codex login` is the wrong instruction for it.
         } else if info.installed {
-            info.agent_note = Some("Sign in with `codex login` to chat with it here.".to_string());
+            info.agent_note = Some(format!(
+                "Sign in with `{}` to chat with it here.",
+                self.login_hint()
+            ));
         } else {
-            info.agent_note = Some(
-                "Install Codex (developers.openai.com/codex), then sign in with `codex login`."
-                    .to_string(),
-            );
+            info.agent_note = Some(format!(
+                "Install Codex (developers.openai.com/codex), then sign in with `{}`.",
+                self.login_hint()
+            ));
         }
         Some(info)
     }
@@ -905,11 +957,14 @@ async fn resume_for_compaction(
 #[async_trait]
 impl Harness for Codex {
     fn id(&self) -> &'static str {
-        "codex"
+        self.profile.harness_id()
     }
 
     fn name(&self) -> &'static str {
-        "Codex"
+        match self.profile {
+            CodexProfile::Primary => "Codex",
+            CodexProfile::Secondary => "Codex (2nd account)",
+        }
     }
 
     fn supports_chat(&self) -> bool {
@@ -934,14 +989,16 @@ impl Harness for Codex {
         let client = match live {
             Some(client) if client.resumed_thread().as_deref() == Some(thread_id) => client,
             _ => {
-                let session = codex_native_session(thread_id).await?.ok_or_else(|| {
-                    anyhow!("Codex's saved thread is missing — cannot compact this chat")
-                })?;
+                let session = codex_native_session(self.profile, thread_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("Codex's saved thread is missing — cannot compact this chat")
+                    })?;
                 let (repo, playbook_md) = codex_playbook(&ctx.project, &ctx.session_id).await?;
                 let client = ctx
                     .host
                     .codex
-                    .ensure(&ctx.session_id, session.store)
+                    .ensure(&ctx.session_id, self.profile, session.store)
                     .await?;
                 let config = if ctx.permission_mode == Some(PermissionMode::Bypass) {
                     Value::Null
@@ -992,7 +1049,13 @@ impl Harness for Codex {
                     TurnEvent::Closed => return Err(anyhow!("codex closed during compaction")),
                 };
                 if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
-                    record_unowned(client.session_id(), client.turn_models(), &method, &params);
+                    record_unowned(
+                        client.profile().harness_id(),
+                        client.session_id(),
+                        client.turn_models(),
+                        &method,
+                        &params,
+                    );
                     continue;
                 }
                 let event_turn = event_turn_id(&params);
@@ -1080,7 +1143,7 @@ impl Harness for Codex {
 
     async fn one_shot(&self, request: OneShot<'_>) -> Result<String> {
         let bin = find_codex().ok_or_else(|| anyhow!("{} is not installed", self.name()))?;
-        codex_one_shot(&bin, request).await
+        codex_one_shot(&bin, self.profile, request).await
     }
 
     fn options(&self) -> HarnessOptions {
@@ -1212,7 +1275,10 @@ impl Harness for Codex {
     }
 
     fn config_home(&self) -> Option<PathBuf> {
-        Some(native_store::codex_home(NativeStore::Legacy))
+        Some(native_store::codex_home_for(
+            self.profile,
+            NativeStore::Legacy,
+        ))
     }
 
     fn skill_target(&self) -> Option<PathBuf> {
@@ -1238,7 +1304,7 @@ impl Harness for Codex {
         // Keep the legacy `/orx` prompt for codex versions that don't yet read
         // `~/.agents/skills/`.
         vec![(
-            native_store::codex_home(NativeStore::Legacy)
+            native_store::codex_home_for(self.profile, NativeStore::Legacy)
                 .join("prompts")
                 .join("orx.md"),
             super::CODEX_PROMPT,
@@ -1252,7 +1318,7 @@ impl Harness for Codex {
     fn plugin_skills_dirs(&self) -> Vec<(String, PathBuf)> {
         type Inventory = (std::time::Instant, PathBuf, Vec<(String, PathBuf)>);
         static CACHE: std::sync::Mutex<Option<Inventory>> = std::sync::Mutex::new(None);
-        let home = native_store::codex_home(NativeStore::Legacy);
+        let home = native_store::codex_home_for(self.profile, NativeStore::Legacy);
         let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((at, cached_home, dirs)) = &*cache {
             if *cached_home == home && at.elapsed() < Duration::from_secs(60) {
@@ -2643,7 +2709,11 @@ async fn ensure_codex_pre_accept(
     native_store: NativeStore,
 ) -> Result<Arc<CodexClient>> {
     loop {
-        let ensure = ctx.host.codex.ensure(&ctx.session_id, native_store);
+        let profile = CodexProfile::of_harness(&ctx.harness);
+        let ensure = ctx
+            .host
+            .codex
+            .ensure(&ctx.session_id, profile, native_store);
         let result = match ctx.orx_retry_remaining() {
             Some(remaining) => tokio::time::timeout(remaining, ensure)
                 .await
@@ -2735,8 +2805,9 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     ctx.host.resolve_stale_prompts(&ctx.session_id, true)?;
     let (repo, playbook_md) = codex_playbook(&ctx.project, &ctx.session_id).await?;
 
+    let profile = CodexProfile::of_harness(&ctx.harness);
     let native_session = match ctx.native_session_id.as_deref() {
-        Some(id) => codex_native_session(id).await?,
+        Some(id) => codex_native_session(profile, id).await?,
         None => None,
     };
     let preferred_store = native_session
@@ -2799,7 +2870,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
                 Err(err) => {
                     // Transport failures never reach this arm. Recover only if
                     // the exact rollout disappeared after the initial lookup.
-                    if codex_native_session(&id).await?.is_some() {
+                    if codex_native_session(profile, &id).await?.is_some() {
                         ctx.mark_terminal_failure("json_rpc", err.to_string());
                         return Err(anyhow!("codex thread/resume failed: {err}"));
                     }
@@ -3015,7 +3086,13 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
             TurnEvent::Notification { method, params } => {
                 let scope = classify_event_thread(turn_id.as_deref(), &sub_threads, &params);
                 if matches!(scope, EventScope::Stale) || method == "turn/completed" {
-                    record_unowned(client.session_id(), client.turn_models(), &method, &params);
+                    record_unowned(
+                        client.profile().harness_id(),
+                        client.session_id(),
+                        client.turn_models(),
+                        &method,
+                        &params,
+                    );
                 }
                 match scope {
                     EventScope::Stale => continue,
@@ -3890,17 +3967,19 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             .await
             .map_err(|e| anyhow!("playbook task failed: {e}"))??;
 
+    let profile = CodexProfile::of_harness(&ctx.harness);
     let native_session = match ctx.native_session_id.as_deref() {
-        Some(id) => codex_native_session(id).await?,
+        Some(id) => codex_native_session(profile, id).await?,
         None => None,
     };
     let native_store = native_session
         .as_ref()
         .map(|session| session.store)
         .unwrap_or(NativeStore::Isolated);
-    let codex_home = tokio::task::spawn_blocking(move || native_store::prepare_codex(native_store))
-        .await
-        .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
+    let codex_home =
+        tokio::task::spawn_blocking(move || native_store::prepare_codex_for(profile, native_store))
+            .await
+            .map_err(|error| anyhow!("Codex config preparation failed: {error}"))??;
     let policy = if ctx.plan_mode {
         Some("read-only")
     } else {
@@ -3930,7 +4009,9 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
         .current_dir(&repo)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(crate::local::chat::harness_log("codex")?))
+        .stderr(Stdio::from(crate::local::chat::harness_log(
+            profile.harness_id(),
+        )?))
         .kill_on_drop(true);
     // Permission mode → sandbox policy. `codex exec` can't prompt, so the
     // sandbox is the approval boundary: non-bypass modes run sandboxed with
@@ -4020,7 +4101,12 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     // Tag the run this sandboxed turn may launch (`orx exp run`) with the
     // session so it can be explicitly subscribed to. After prepare_env so it
     // isn't shadowed by a synced value.
-    set_chat_session_env(&mut cmd, &ctx.session_id, "codex", ctx.host.up_port());
+    set_chat_session_env(
+        &mut cmd,
+        &ctx.session_id,
+        profile.harness_id(),
+        ctx.host.up_port(),
+    );
     // Pin the sandboxed turn's store to the exact path granted above. The
     // grant was resolved from the host's env, but the child could resolve a
     // different data dir — `prepare_env` injects dashboard-synced vars (a
@@ -4189,11 +4275,14 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     Ok(())
 }
 
+/// The rollout of `native_id` in `profile`'s stores only: a `codex2` thread
+/// resumes, recovers and compacts from `~/.codex2`, never from `~/.codex`.
 async fn codex_native_session(
+    profile: CodexProfile,
     native_id: &str,
 ) -> Result<Option<native_store::NativeSessionLocation>> {
     let native_id = native_id.to_string();
-    tokio::task::spawn_blocking(move || native_store::codex_session(&native_id))
+    tokio::task::spawn_blocking(move || native_store::codex_session_for(profile, &native_id))
         .await
         .map_err(|error| anyhow!("codex rollout lookup failed: {error}"))?
 }
@@ -4253,6 +4342,91 @@ fn handle_item(ctx: &mut TurnCtx, item: &Value, next_id: &mut impl FnMut(&str) -
             });
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod codex2_tests {
+    use super::*;
+    use crate::local::harness::{
+        chat_harness, is_chat_harness, is_codex, registry, service_tier_for,
+    };
+
+    fn fake_auth(home: &Path, email: &str, plan: &str) {
+        use base64::Engine as _;
+        let claims = serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": { "chatgpt_plan_type": plan },
+        });
+        let b64 = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        let jwt = format!("{}.{}.sig", b64(b"{}"), b64(claims.to_string().as_bytes()));
+        std::fs::create_dir_all(home).unwrap();
+        std::fs::write(
+            home.join("auth.json"),
+            serde_json::json!({ "tokens": { "id_token": jwt } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex2_is_registered_next_to_codex() {
+        let ids: Vec<String> = registry().iter().map(|h| h.id().to_string()).collect();
+        let codex = ids.iter().position(|id| id == "codex").unwrap();
+        assert_eq!(ids.get(codex + 1).map(String::as_str), Some("codex2"));
+        assert_eq!(ids.iter().filter(|id| *id == "codex2").count(), 1);
+        let harness = chat_harness("codex2").unwrap();
+        assert_eq!(harness.name(), "Codex (2nd account)");
+        assert!(harness.supports_chat() && harness.supports_compaction());
+        assert!(is_chat_harness("codex2"));
+        assert_eq!(chat_harness("codex").unwrap().name(), "Codex");
+        assert!(is_codex("codex") && is_codex("codex2") && !is_codex("opencode"));
+        assert_eq!(service_tier_for("codex2", "priority"), Some("priority"));
+        assert_eq!(service_tier_for("opencode", "priority"), None);
+        // Same permission choices and CLI as codex.
+        assert_eq!(
+            format!("{:?}", Codex.options().permission_modes),
+            format!("{:?}", Codex2.options().permission_modes)
+        );
+    }
+
+    #[test]
+    fn each_profile_keeps_its_own_config_home() {
+        let primary = Codex.config_home().unwrap();
+        let secondary = Codex2.config_home().unwrap();
+        assert_ne!(primary, secondary);
+        assert_eq!(
+            secondary,
+            native_store::codex_home_for(CodexProfile::Secondary, NativeStore::Legacy)
+        );
+        assert!(Codex2.extra_skill_targets()[0].0.starts_with(&secondary));
+        assert!(Codex.extra_skill_targets()[0].0.starts_with(&primary));
+        // The native skill is shared (`~/.agents/skills`), like the binary.
+        assert_eq!(Codex.skill_target(), Codex2.skill_target());
+    }
+
+    #[tokio::test]
+    async fn auth_is_detected_per_home() {
+        let root = std::env::temp_dir().join(format!("orx-codex2-auth-{}", uuid::Uuid::new_v4()));
+        let first = root.join(".codex");
+        let second = root.join(".codex2");
+        fake_auth(&first, "first@example.com", "plus");
+        fake_auth(&second, "second@example.com", "pro");
+
+        let primary = Codex.detect_in(&first, true).await.unwrap();
+        assert_eq!(primary.id, "codex");
+        assert!(primary.authenticated);
+        assert_eq!(primary.account.as_deref(), Some("first@example.com"));
+
+        let secondary = Codex2.detect_in(&second, true).await.unwrap();
+        assert_eq!(secondary.id, "codex2");
+        assert!(secondary.authenticated);
+        assert_eq!(secondary.account.as_deref(), Some("second@example.com"));
+        assert_ne!(primary.plan, secondary.plan);
+
+        let empty = Codex2.detect_in(&root.join("missing"), true).await.unwrap();
+        assert!(!empty.authenticated);
+        assert!(empty.account.is_none());
+        std::fs::remove_dir_all(root).ok();
     }
 }
 

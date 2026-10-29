@@ -46,6 +46,7 @@ export type ModelSelection = AgentSelection;
 export const HARNESS_LABELS: Record<HarnessId, string> = {
   "claude-code": "Claude Code",
   codex: "Codex",
+  codex2: "Codex (2nd account)",
   opencode: "OpenCode",
   cursor: "Cursor",
   antigravity: "Google Antigravity",

@@ -434,7 +434,7 @@ function HarnessesTab({ remote }: { remote: boolean }) {
   };
 
   const orderedHarnesses = [...(harnesses ?? [])].sort((a, b) => {
-    const rank = (id: HarnessId) => id === "claude-code" ? 0 : id === "codex" ? 1 : id === "opencode" ? 2 : 3;
+    const rank = (id: HarnessId) => id === "claude-code" ? 0 : id === "codex" || id === "codex2" ? 1 : id === "opencode" ? 2 : 3;
     return rank(a.id) - rank(b.id);
   });
   const added = orderedHarnesses.filter((h) => h.installed || h.installBroken || definitions.data?.some((definition) => definition.id === h.id));

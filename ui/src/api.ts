@@ -1517,7 +1517,12 @@ export const reportLocale = (locale: string): void => {
   void post<{ locale: string }>("/api/telemetry/locale", { locale }).catch(() => {});
 };
 
-export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | `acp:${string}`;
+export type HarnessId = "claude-code" | "codex" | "codex2" | "opencode" | "cursor" | "antigravity" | `acp:${string}`;
+
+/** Codex-family harnesses: stock `codex` and the fork's second-account `codex2` (same CLI, own CODEX_HOME). */
+export function isCodexHarness(id: string | null | undefined): boolean {
+  return id === "codex" || id === "codex2";
+}
 
 export interface HarnessModel {
   id: string;
@@ -1621,7 +1626,7 @@ export function serviceTiersFor(
   harness: Harness | undefined,
   modelId: string | null | undefined,
 ): OptionChoice[] {
-  if (harness?.id !== "codex") return [];
+  if (!harness || !isCodexHarness(harness.id)) return [];
   const tiers = harness.models.find((model) => model.id === modelId)?.serviceTiers;
   if (!tiers?.length) return [];
   return [
@@ -1637,7 +1642,7 @@ export function reconcileServiceTier(
 ): string | null {
   // Harness detection is async; preserve a deliberate choice until its catalog loads.
   if (!harness) return current ?? null;
-  if (harness.id !== "codex") return null;
+  if (!isCodexHarness(harness.id)) return null;
   const tiers = harness.models.find((model) => model.id === modelId)?.serviceTiers;
   if (tiers === undefined) return null;
   const choices = serviceTiersFor(harness, modelId);

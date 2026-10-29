@@ -157,7 +157,7 @@ test("Codex and OpenCode terminal limits use the shared disclosure without class
 
 test("live OpenCode questions route composer text to the existing prompt", () => {
   const question = { id: "question", type: "prompt", prompt: { kind: "question", nativeId: '["frm_test","answer"]', resolved: false } };
-  for (const harness of ["opencode", "claude-code", "codex"]) {
+  for (const harness of ["opencode", "claude-code", "codex", "codex2"]) {
     assert.equal(pendingQuestionId([message(question)], harness, true), "question");
     assert.equal(pendingQuestionId([message(question)], harness, false), null);
   }

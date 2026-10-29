@@ -481,9 +481,16 @@ pub fn effective_permission_id(harness_id: &str, stored: Option<&str>) -> Option
     options.default_permission_mode.map(str::to_string)
 }
 
+/// Whether `harness_id` is a Codex-family harness: the stock `codex` or the
+/// fork's second-account `codex2`. Both run the same CLI and protocol, so every
+/// Codex-specific behaviour applies to both; only the `CODEX_HOME` differs.
+pub fn is_codex(harness_id: &str) -> bool {
+    crate::local::native_store::CodexProfile::from_harness(harness_id).is_some()
+}
+
 /// Validate the processing tiers ORX exposes for Codex.
 pub fn service_tier_for<'a>(harness_id: &str, id: &'a str) -> Option<&'a str> {
-    (harness_id == "codex" && matches!(id, "default" | "priority")).then_some(id)
+    (is_codex(harness_id) && matches!(id, "default" | "priority")).then_some(id)
 }
 
 /// One wait in a harness's turn loop: the harness's own next event, or a
@@ -531,6 +538,8 @@ pub fn registry() -> Vec<Box<dyn Harness>> {
     let mut harnesses: Vec<Box<dyn Harness>> = vec![
         Box::new(claude::ClaudeCode),
         Box::new(codex::Codex),
+        // Fork: the same Codex CLI on a second account (`~/.codex2`).
+        Box::new(codex::Codex2),
         Box::new(opencode::OpenCode),
         Box::new(cursor::Cursor),
         Box::new(antigravity::Antigravity),

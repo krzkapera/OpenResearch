@@ -4315,7 +4315,7 @@ impl ChatHost {
                 if let Ok(store) = Store::open() {
                     if let Ok(Some(current)) = store.get_chat_session(session_id) {
                         let reset_pending = !plan_mode
-                            && current.harness == "codex"
+                            && crate::local::harness::is_codex(&current.harness)
                             && (current.plan_mode || current.plan_reset_pending);
                         if store
                             .set_chat_session_plan_state(session_id, plan_mode, reset_pending)
@@ -4731,7 +4731,7 @@ impl ChatHost {
                 }
                 let plan_state = settings.plan_mode.map(|plan_mode| {
                     let reset_pending = !plan_mode
-                        && session.harness == "codex"
+                        && crate::local::harness::is_codex(&session.harness)
                         && (session.plan_mode || session.plan_reset_pending);
                     (plan_mode, reset_pending)
                 });
@@ -5341,7 +5341,7 @@ impl ChatHost {
                             .get_chat_session(session_id)?
                             .ok_or_else(|| anyhow!("chat session not found"))?;
                         let reset_pending = !plan_mode
-                            && current.harness == "codex"
+                            && crate::local::harness::is_codex(&current.harness)
                             && (current.plan_mode || current.plan_reset_pending);
                         // Every busy send carries the composer's plan state, so
                         // only write when it actually moves.
@@ -5434,21 +5434,22 @@ impl ChatHost {
                 )
             }
         };
-        let reset_codex_model = if overrides.clear_model && session.harness == "codex" {
-            match session.native_session_id.as_deref() {
-                Some(native_id) => {
-                    session.model.is_some()
-                        || store.chat_native_thread_has_named_model(session_id, native_id)?
+        let reset_codex_model =
+            if overrides.clear_model && crate::local::harness::is_codex(&session.harness) {
+                match session.native_session_id.as_deref() {
+                    Some(native_id) => {
+                        session.model.is_some()
+                            || store.chat_native_thread_has_named_model(session_id, native_id)?
+                    }
+                    None => false,
                 }
-                None => false,
-            }
-        } else {
-            false
-        };
+            } else {
+                false
+            };
         if replace_settings {
             let plan_state = overrides.plan_mode.map(|plan_mode| {
                 let reset_pending = !plan_mode
-                    && session.harness == "codex"
+                    && crate::local::harness::is_codex(&session.harness)
                     && (session.plan_mode || session.plan_reset_pending);
                 (plan_mode, reset_pending)
             });
@@ -5529,7 +5530,7 @@ impl ChatHost {
                 overrides.plan_revision,
             );
             let reset_pending = !plan_mode
-                && current.harness == "codex"
+                && crate::local::harness::is_codex(&current.harness)
                 && (current.plan_mode || current.plan_reset_pending);
             if current.plan_mode != plan_mode || current.plan_reset_pending != reset_pending {
                 store.set_chat_session_plan_state(&session.id, plan_mode, reset_pending)?;
@@ -6071,7 +6072,7 @@ impl ChatHost {
                             if let Some(nid) = &session.native_session_id {
                                 let _ = host.opencode.interrupt(&session_id, nid).await;
                             }
-                        } else if session.harness == "codex" {
+                        } else if crate::local::harness::is_codex(&session.harness) {
                             return host.codex.interrupt_session(&session_id).await;
                         } else if session.harness == "claude-code" {
                             host.claude.kill_session(&session_id).await;
@@ -6487,7 +6488,7 @@ impl ChatHost {
                 .get(session_id)
                 .map_or(1, |(revision, _)| revision + 1);
             let reset_pending = !plan_mode
-                && session.harness == "codex"
+                && crate::local::harness::is_codex(&session.harness)
                 && (session.plan_mode || session.plan_reset_pending);
             store.set_chat_session_plan_state(session_id, plan_mode, reset_pending)?;
             changes.insert(session_id.to_string(), (revision, plan_mode));

@@ -67,11 +67,78 @@ pub fn claude_secure_storage_config_dir() -> OsString {
         .unwrap_or_default()
 }
 
+/// Which Codex account a Codex-family harness runs on. `Primary` is the stock
+/// `codex` harness (`$CODEX_HOME`, default `~/.codex`); `Secondary` is the
+/// fork's `codex2` harness: the same CLI against a second, fully separate
+/// home (`$ORX_CODEX2_HOME`, default `~/.codex2`) with its own login, sessions
+/// and state. Nothing of one home is ever read or linked into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CodexProfile {
+    Primary,
+    Secondary,
+}
+
+impl CodexProfile {
+    /// The profile behind a harness id; `None` for a non-Codex harness.
+    pub fn from_harness(harness_id: &str) -> Option<Self> {
+        match harness_id {
+            "codex" => Some(Self::Primary),
+            "codex2" => Some(Self::Secondary),
+            _ => None,
+        }
+    }
+
+    /// The profile of a session's harness id, `Primary` for anything else
+    /// (the stock behaviour every pre-`codex2` caller had).
+    pub fn of_harness(harness_id: &str) -> Self {
+        Self::from_harness(harness_id).unwrap_or(Self::Primary)
+    }
+
+    pub fn harness_id(self) -> &'static str {
+        match self {
+            Self::Primary => "codex",
+            Self::Secondary => "codex2",
+        }
+    }
+
+    /// Both profiles, primary first.
+    pub const ALL: [Self; 2] = [Self::Primary, Self::Secondary];
+}
+
+/// Env var that relocates the `codex2` home (the counterpart of `CODEX_HOME`).
+pub const CODEX2_HOME_ENV: &str = "ORX_CODEX2_HOME";
+
 pub fn codex_home(store: NativeStore) -> PathBuf {
-    match store {
-        NativeStore::Isolated => crate::store::data_dir().join("agents/codex"),
-        NativeStore::Legacy => {
-            user_env_path("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex"))
+    codex_home_for(CodexProfile::Primary, store)
+}
+
+pub fn codex_home_for(profile: CodexProfile, store: NativeStore) -> PathBuf {
+    codex_home_with(
+        profile,
+        store,
+        crate::store::data_dir,
+        home_dir,
+        user_env_path,
+    )
+}
+
+/// [`codex_home_for`] over explicit roots, so the mapping is testable without
+/// touching the process environment.
+fn codex_home_with(
+    profile: CodexProfile,
+    store: NativeStore,
+    data_dir: impl FnOnce() -> PathBuf,
+    home: impl FnOnce() -> PathBuf,
+    env: impl FnOnce(&str) -> Option<PathBuf>,
+) -> PathBuf {
+    match (profile, store) {
+        (CodexProfile::Primary, NativeStore::Isolated) => data_dir().join("agents/codex"),
+        (CodexProfile::Primary, NativeStore::Legacy) => {
+            env("CODEX_HOME").unwrap_or_else(|| home().join(".codex"))
+        }
+        (CodexProfile::Secondary, NativeStore::Isolated) => data_dir().join("agents/codex2"),
+        (CodexProfile::Secondary, NativeStore::Legacy) => {
+            env(CODEX2_HOME_ENV).unwrap_or_else(|| home().join(".codex2"))
         }
     }
 }
@@ -202,7 +269,46 @@ pub fn claude_session(native_id: &str) -> Result<Option<NativeSessionLocation>> 
 }
 
 pub fn codex_session(native_id: &str) -> Result<Option<NativeSessionLocation>> {
-    session_location(codex_home, &["sessions", "archived_sessions"], native_id)
+    codex_session_for(CodexProfile::Primary, native_id)
+}
+
+/// A rollout in one profile's stores only — what resume, recovery and
+/// compaction use, so a `codex2` thread is never resumed from `~/.codex`.
+pub fn codex_session_for(
+    profile: CodexProfile,
+    native_id: &str,
+) -> Result<Option<NativeSessionLocation>> {
+    codex_session_in(&codex_home_for, profile, native_id)
+}
+
+/// A rollout in whichever profile holds it (thread ids are UUIDs, so at most
+/// one does). Read-only lookups by thread id only — never for resuming.
+pub fn codex_session_any(native_id: &str) -> Result<Option<NativeSessionLocation>> {
+    codex_session_any_in(&codex_home_for, native_id)
+}
+
+fn codex_session_in(
+    homes: &dyn Fn(CodexProfile, NativeStore) -> PathBuf,
+    profile: CodexProfile,
+    native_id: &str,
+) -> Result<Option<NativeSessionLocation>> {
+    session_location(
+        |store| homes(profile, store),
+        &["sessions", "archived_sessions"],
+        native_id,
+    )
+}
+
+fn codex_session_any_in(
+    homes: &dyn Fn(CodexProfile, NativeStore) -> PathBuf,
+    native_id: &str,
+) -> Result<Option<NativeSessionLocation>> {
+    for profile in CodexProfile::ALL {
+        if let Some(found) = codex_session_in(homes, profile, native_id)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
 }
 
 pub fn cursor_session(native_id: &str) -> Result<Option<NativeSessionLocation>> {
@@ -359,8 +465,14 @@ pub fn prepare_claude(store: NativeStore) -> Result<PathBuf> {
 }
 
 pub fn prepare_codex(store: NativeStore) -> Result<PathBuf> {
-    let root = codex_home(store);
-    let legacy = codex_home(NativeStore::Legacy);
+    prepare_codex_for(CodexProfile::Primary, store)
+}
+
+/// The profile's `CODEX_HOME` for `store`: the legacy home itself, or an
+/// isolated home whose shared files are links into that profile's legacy home.
+pub fn prepare_codex_for(profile: CodexProfile, store: NativeStore) -> Result<PathBuf> {
+    let root = codex_home_for(profile, store);
+    let legacy = codex_home_for(profile, NativeStore::Legacy);
     if store == NativeStore::Legacy || root == legacy {
         std::fs::create_dir_all(&root)?;
         return Ok(root);
@@ -746,6 +858,177 @@ mod tests {
             .unwrap();
         assert!(opencode_has_session(&db, "id").unwrap());
         assert!(!opencode_has_session(&db, "missing").unwrap());
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(test)]
+mod codex_profile_tests {
+    use super::*;
+
+    fn roots() -> (PathBuf, PathBuf) {
+        (PathBuf::from("/data/orx"), PathBuf::from("/home/ra"))
+    }
+
+    fn home(profile: CodexProfile, store: NativeStore, env: &[(&str, &str)]) -> PathBuf {
+        let (data, user) = roots();
+        codex_home_with(
+            profile,
+            store,
+            || data,
+            || user,
+            |key| {
+                env.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| PathBuf::from(v))
+            },
+        )
+    }
+
+    #[test]
+    fn profiles_map_to_harness_ids() {
+        assert_eq!(
+            CodexProfile::from_harness("codex"),
+            Some(CodexProfile::Primary)
+        );
+        assert_eq!(
+            CodexProfile::from_harness("codex2"),
+            Some(CodexProfile::Secondary)
+        );
+        assert_eq!(CodexProfile::from_harness("claude-code"), None);
+        assert_eq!(CodexProfile::from_harness("codex3"), None);
+        assert_eq!(CodexProfile::of_harness("opencode"), CodexProfile::Primary);
+        for profile in CodexProfile::ALL {
+            assert_eq!(
+                CodexProfile::from_harness(profile.harness_id()),
+                Some(profile)
+            );
+        }
+    }
+
+    #[test]
+    fn primary_home_is_unchanged() {
+        use CodexProfile::Primary;
+        assert_eq!(
+            home(Primary, NativeStore::Legacy, &[]),
+            PathBuf::from("/home/ra/.codex")
+        );
+        assert_eq!(
+            home(
+                Primary,
+                NativeStore::Legacy,
+                &[("CODEX_HOME", "/elsewhere")]
+            ),
+            PathBuf::from("/elsewhere")
+        );
+        // ORX_CODEX2_HOME never moves the primary account.
+        assert_eq!(
+            home(
+                Primary,
+                NativeStore::Legacy,
+                &[(CODEX2_HOME_ENV, "/second")]
+            ),
+            PathBuf::from("/home/ra/.codex")
+        );
+        assert_eq!(
+            home(Primary, NativeStore::Isolated, &[]),
+            PathBuf::from("/data/orx/agents/codex")
+        );
+    }
+
+    #[test]
+    fn secondary_home_is_separate_and_configurable() {
+        use CodexProfile::Secondary;
+        assert_eq!(
+            home(Secondary, NativeStore::Legacy, &[]),
+            PathBuf::from("/home/ra/.codex2")
+        );
+        // CODEX_HOME (the primary's override) never leaks into codex2.
+        assert_eq!(
+            home(
+                Secondary,
+                NativeStore::Legacy,
+                &[("CODEX_HOME", "/elsewhere")]
+            ),
+            PathBuf::from("/home/ra/.codex2")
+        );
+        assert_eq!(
+            home(
+                Secondary,
+                NativeStore::Legacy,
+                &[(CODEX2_HOME_ENV, "/second")]
+            ),
+            PathBuf::from("/second")
+        );
+        assert_eq!(
+            home(Secondary, NativeStore::Isolated, &[]),
+            PathBuf::from("/data/orx/agents/codex2")
+        );
+    }
+
+    #[test]
+    fn resume_lookup_stays_inside_the_profile_home() {
+        let root = std::env::temp_dir().join(format!("orx-codex2-{}", uuid::Uuid::new_v4()));
+        let homes = |profile: CodexProfile, store: NativeStore| {
+            let name = match (profile, store) {
+                (CodexProfile::Primary, NativeStore::Legacy) => "dot-codex",
+                (CodexProfile::Primary, NativeStore::Isolated) => "agents/codex",
+                (CodexProfile::Secondary, NativeStore::Legacy) => "dot-codex2",
+                (CodexProfile::Secondary, NativeStore::Isolated) => "agents/codex2",
+            };
+            root.join(name)
+        };
+        let primary_thread = "11111111-1111-4111-8111-111111111111";
+        let secondary_thread = "22222222-2222-4222-8222-222222222222";
+        let write = |dir: &str, thread: &str| {
+            let path = root.join(dir).join(format!(
+                "sessions/2026/10/29/rollout-2026-10-29T20-00-00-{thread}.jsonl"
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{}").unwrap();
+            path
+        };
+        let primary_path = write("agents/codex", primary_thread);
+        let secondary_path = write("dot-codex2", secondary_thread);
+
+        let found = codex_session_in(&homes, CodexProfile::Secondary, secondary_thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.path, secondary_path);
+        assert_eq!(found.store, NativeStore::Legacy);
+        let found = codex_session_in(&homes, CodexProfile::Primary, primary_thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.path, primary_path);
+        assert_eq!(found.store, NativeStore::Isolated);
+
+        // Neither account resumes the other's thread.
+        assert!(
+            codex_session_in(&homes, CodexProfile::Primary, secondary_thread)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            codex_session_in(&homes, CodexProfile::Secondary, primary_thread)
+                .unwrap()
+                .is_none()
+        );
+
+        // Read-only identity lookups find either.
+        assert_eq!(
+            codex_session_any_in(&homes, secondary_thread)
+                .unwrap()
+                .unwrap()
+                .path,
+            secondary_path
+        );
+        assert_eq!(
+            codex_session_any_in(&homes, primary_thread)
+                .unwrap()
+                .unwrap()
+                .path,
+            primary_path
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

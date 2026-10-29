@@ -5,7 +5,7 @@ export function pendingQuestionId(
   harness: ChatSession["harness"] | undefined,
   busy: boolean,
 ): string | null {
-  if (harness !== "claude-code" && harness !== "codex" && harness !== "opencode") return null;
+  if (harness !== "claude-code" && harness !== "codex" && harness !== "codex2" && harness !== "opencode") return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     for (const part of messages[i].parts) {
       if (part.type !== "prompt" || part.prompt?.resolved || part.prompt?.kind !== "question") continue;

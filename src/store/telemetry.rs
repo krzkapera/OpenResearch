@@ -33,8 +33,15 @@ fn valid_model_label(label: &str) -> bool {
 
 impl InvocationIdentity {
     pub fn validate(&self) -> Result<()> {
-        if !["claude-code", "codex", "opencode", "cursor", "antigravity"]
-            .contains(&self.harness.as_str())
+        if ![
+            "claude-code",
+            "codex",
+            "codex2",
+            "opencode",
+            "cursor",
+            "antigravity",
+        ]
+        .contains(&self.harness.as_str())
         {
             return Err(anyhow!("Invalid invoking harness"));
         }
@@ -724,8 +731,10 @@ mod tests {
         let store = Store::open_at(dir.clone()).unwrap();
         let models = std::sync::Mutex::new(std::collections::HashMap::new());
         let record = |method: &str, params: serde_json::Value| {
-            crate::local::harness::codex::record_unowned_in(&store, "s", &models, method, &params)
-                .unwrap()
+            crate::local::harness::codex::record_unowned_in(
+                &store, "codex", "s", &models, method, &params,
+            )
+            .unwrap()
         };
         let counters = |n: u64| TokenUsage {
             input_tokens: Some(n),
