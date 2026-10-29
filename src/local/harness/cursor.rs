@@ -44,7 +44,10 @@ use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
 use crate::local::shell_env::{find_in_dir, find_on_path};
 
 const CURSOR_REINSTALL: &str = "Reinstall it from cursor.com/install";
-const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// `agent status` answers in ~2s alone on a 1-vCPU host but ~11s while it
+/// shares the CPU with a full harness sweep; 10s timed out there and showed a
+/// signed-in Cursor as needing `agent login`.
+const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const MODELS_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Cursor;
