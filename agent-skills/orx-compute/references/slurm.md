@@ -54,6 +54,10 @@ snapshot.
   may still appear in the CLI or Settings UI but are **not required** for
   submit and are not injected into the batch script — put those directives in
   `job.sbatch`.
+- `--cpus N` and `--mem 64G` (Slurm syntax: `K`/`M`/`G`/`T` or bare MB) are
+  optional per-run overrides passed to `sbatch` as `--cpus-per-task` /
+  `--mem`; they beat the matching `#SBATCH` lines. Omit them and `job.sbatch`
+  decides, exactly as before. They are rejected on other backends.
 - There is no image flag. The cluster environment—modules, conda, and login
   profile—is used as-is.
 - A detached `orx supervise` process records scheduler status and logs; do not

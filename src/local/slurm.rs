@@ -21,12 +21,29 @@ pub async fn launch_local_slurm(args: &crate::ExpRunArgs) -> Result<()> {
         backend.namespace.as_deref().unwrap_or(""),
         backend.job_id.as_deref().unwrap_or("")
     );
+    if let Some(resources) = requested_resources(&backend) {
+        println!("  {resources}");
+    }
     println!("  run  {}", run.id);
     println!(
         "{}",
         crate::invocation::follow_up(&run.experiment_id, &run.id)
     );
     Ok(())
+}
+
+/// The launch-summary line for a Slurm job submitted with `--cpus`/`--mem`.
+pub fn requested_resources(backend: &BackendDescriptor) -> Option<String> {
+    if backend.cpus_per_task.is_none() && backend.mem.is_none() {
+        return None;
+    }
+    Some(format!(
+        "cpus {}  mem {}",
+        backend
+            .cpus_per_task
+            .map_or_else(|| "job.sbatch".into(), |c| c.to_string()),
+        backend.mem.as_deref().unwrap_or("job.sbatch")
+    ))
 }
 
 /// Submit the local experiment's run as a Slurm batch job and detach a
@@ -57,7 +74,7 @@ pub async fn submit_local_slurm_with_source(
         if f.trim().to_ascii_lowercase().starts_with("cpu") {
             return Err(anyhow!(
                 "--flavor names GPUs on --backend slurm (e.g. h100:2). For a CPU-only \
-                 run just omit --flavor; put CPU requests in job.sbatch instead."
+                 run just omit --flavor; put CPU requests in job.sbatch (or pass --cpus/--mem)."
             ));
         }
     }
@@ -79,6 +96,10 @@ pub async fn submit_local_slurm_with_source(
     // `--timeout` beats the settings default; neither = the cluster's default.
     let time_limit_secs =
         slurm::resolve_time_limit(args.timeout.as_deref(), settings.time_limit.as_deref())?;
+
+    // Fork: only explicit flags override job.sbatch (saved settings never do).
+    let cpus_per_task = args.cpus.filter(|c| *c > 0);
+    let mem = args.mem.as_deref().map(slurm::parse_mem).transpose()?;
 
     let store = Store::open()?;
     let exp = store
@@ -113,6 +134,8 @@ pub async fn submit_local_slurm_with_source(
         remote_root: remote_root.clone(),
         sbatch_path: "job.sbatch".to_string(),
         time_limit_secs,
+        cpus_per_task,
+        mem: mem.clone(),
     })
     .await?;
 
@@ -133,6 +156,8 @@ pub async fn submit_local_slurm_with_source(
         ssh_port: None,
         ssh_user: None,
         timeout_secs: time_limit_secs,
+        cpus_per_task,
+        mem: mem.clone(),
         source_digest: None,
         source_path: None,
         source_size: None,

@@ -586,6 +586,16 @@ pub struct ExpRunArgs {
     /// Not supported with `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
+    /// Cores for the job (with `--backend slurm`): passed to `sbatch` as
+    /// `--cpus-per-task=N`, overriding the `#SBATCH --cpus-per-task` line of
+    /// the agent-authored job.sbatch. Omitted = job.sbatch decides.
+    #[arg(long)]
+    pub cpus: Option<u32>,
+    /// Host memory for the job (with `--backend slurm`), in Slurm's syntax
+    /// (64G, 4000M, or a bare number for megabytes): passed to `sbatch` as
+    /// `--mem=…`, overriding job.sbatch's `#SBATCH --mem`. Omitted = job.sbatch decides.
+    #[arg(long)]
+    pub mem: Option<String>,
     /// Launch even when another run is already in flight for this experiment.
     #[arg(long)]
     pub force: bool,

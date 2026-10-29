@@ -88,6 +88,12 @@ pub struct BackendDescriptor {
     /// Requested execution limit for OpenResearch and Slurm jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Requested `--cpus-per-task` (slurm_job only; explicit `--cpus` only in the fork).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus_per_task: Option<u32>,
+    /// Requested `--mem` (slurm_job only; explicit `--mem` only in the fork).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem: Option<String>,
     /// Immutable local source archive used for this run. These fields make a
     /// delayed or restarted supervisor independent of the working tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -269,6 +275,8 @@ mod tests {
             ssh_port: None,
             ssh_user: None,
             timeout_secs: Some(14_400),
+            cpus_per_task: None,
+            mem: None,
             source_digest: None,
             source_path: None,
             source_size: None,

@@ -157,6 +157,49 @@ pub struct SlurmJobSpec {
     /// `--timeout` / saved `timeLimit`, passed as `sbatch --time` (a command-line
     /// option overrides the script's `#SBATCH --time`). None = script/cluster default.
     pub time_limit_secs: Option<u64>,
+    /// Explicit `--cpus` only, passed as `sbatch --cpus-per-task=N` (a
+    /// command-line option overrides the script's `#SBATCH` line). None =
+    /// job.sbatch decides — saved settings are never applied to it.
+    pub cpus_per_task: Option<u32>,
+    /// Explicit `--mem` only (validated by `parse_mem`), passed as `sbatch --mem=…`.
+    pub mem: Option<String>,
+}
+
+/// Validate a Slurm memory request: a positive integer with an optional
+/// `K`/`M`/`G`/`T` suffix ("64G", "65536", "4000M"). Bare numbers are
+/// megabytes, as Slurm itself documents. Strict on purpose — the value is
+/// interpolated into the remote `sbatch` command line, so anything that is
+/// not this shape (whitespace, a shell metacharacter) is rejected here.
+pub fn parse_mem(mem: &str) -> Result<String> {
+    let m = mem.trim();
+    let (digits, suffix) = match m.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
+        Some((i, _)) => m.split_at(i),
+        None => (m, ""),
+    };
+    let ok_suffix = matches!(suffix, "" | "K" | "M" | "G" | "T");
+    if digits.is_empty() || digits.trim_start_matches('0').is_empty() || !ok_suffix {
+        return Err(anyhow!(
+            "Unreadable memory request {:?}. Use a positive size in Slurm's own syntax: \
+             64G, 4000M, or a bare number for megabytes.",
+            mem
+        ));
+    }
+    Ok(format!("{digits}{suffix}"))
+}
+
+/// The `sbatch` command-line overrides for a submit, each with a leading space.
+fn sbatch_overrides(spec: &SlurmJobSpec) -> String {
+    let mut flags = String::new();
+    if let Some(secs) = spec.time_limit_secs {
+        flags.push_str(&format!(" --time={}", slurm_time(secs)));
+    }
+    if let Some(c) = spec.cpus_per_task.filter(|c| *c > 0) {
+        flags.push_str(&format!(" --cpus-per-task={c}"));
+    }
+    if let Some(m) = spec.mem.as_deref().and_then(|m| parse_mem(m).ok()) {
+        flags.push_str(&format!(" --mem={m}"));
+    }
+    flags
 }
 
 pub fn resolve_time_limit(explicit: Option<&str>, saved: Option<&str>) -> Result<Option<u64>> {
@@ -268,13 +311,10 @@ pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
     }
 
     // Submit from the run dir so relative --output/--error/exit_code land there.
-    let time = spec
-        .time_limit_secs
-        .map(|secs| format!(" --time={}", slurm_time(secs)))
-        .unwrap_or_default();
+    let overrides = sbatch_overrides(spec);
     let out = ssh_run(
         &SshTarget::alias(&spec.host),
-        &format!("cd {dir_shell} && sbatch --parsable{time} {repo_sbatch}"),
+        &format!("cd {dir_shell} && sbatch --parsable{overrides} {repo_sbatch}"),
         None,
     )
     .await
@@ -500,6 +540,53 @@ pub async fn diagnostics(host: &str, job_id: &str) -> Result<serde_json::Value> 
 mod tests {
     use super::*;
 
+    fn spec_with(time: Option<u64>, cpus: Option<u32>, mem: Option<&str>) -> SlurmJobSpec {
+        SlurmJobSpec {
+            host: "h".into(),
+            run_id: "r".into(),
+            remote_root: DEFAULT_REMOTE_ROOT.into(),
+            sbatch_path: "job.sbatch".into(),
+            time_limit_secs: time,
+            cpus_per_task: cpus,
+            mem: mem.map(str::to_string),
+        }
+    }
+
+    /// Fork: job.sbatch stays authoritative unless a flag was given explicitly;
+    /// only then does a command-line override reach `sbatch`.
+    #[test]
+    fn sbatch_overrides_only_carry_explicit_flags() {
+        assert_eq!(sbatch_overrides(&spec_with(None, None, None)), "");
+        assert_eq!(
+            sbatch_overrides(&spec_with(Some(3600), Some(8), Some("64G"))),
+            " --time=01:00:00 --cpus-per-task=8 --mem=64G"
+        );
+        assert_eq!(sbatch_overrides(&spec_with(None, Some(0), Some(" "))), "");
+        assert_eq!(
+            sbatch_overrides(&spec_with(None, None, Some("64G;rm -rf ~"))),
+            ""
+        );
+    }
+
+    #[test]
+    fn mem_parses_slurm_sizes_and_rejects_the_rest() {
+        assert_eq!(parse_mem("64G").unwrap(), "64G");
+        assert_eq!(parse_mem(" 4000M ").unwrap(), "4000M");
+        assert_eq!(parse_mem("65536").unwrap(), "65536");
+        for bad in [
+            "",
+            "0",
+            "G",
+            "64g",
+            "64GB",
+            "64 G",
+            "-1",
+            "64G\n#SBATCH --account=x",
+        ] {
+            assert!(parse_mem(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
     #[test]
     fn normalize_remote_root_strips_tilde_and_home() {
         assert_eq!(normalize_remote_root("~/scratch/.orx"), "scratch/.orx");
@@ -620,6 +707,8 @@ mod tests {
             remote_root: remote_root.clone(),
             sbatch_path: "job.sbatch".into(),
             time_limit_secs: Some(300),
+            cpus_per_task: None,
+            mem: None,
         };
         let poll = |run_id: String, job_id: String, until: &'static [&'static str]| {
             let host = host.clone();

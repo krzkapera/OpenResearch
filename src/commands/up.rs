@@ -2106,6 +2106,10 @@ struct CreateRunReq {
     manifest: Option<String>,
     image: Option<String>,
     timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpus: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mem: Option<String>,
     org: Option<String>,
     provider: Option<String>,
     disk: Option<i64>,
@@ -2192,6 +2196,8 @@ pub(crate) async fn submit_run_via_up(
         manifest: args.manifest.clone(),
         image: args.image.clone(),
         timeout: args.timeout.clone(),
+        cpus: args.cpus,
+        mem: args.mem.clone(),
         org: args.org.clone(),
         provider: args.provider.clone(),
         disk: args.disk,
@@ -2292,6 +2298,8 @@ async fn create_run(State(state): State<AppState>, Json(req): Json<CreateRunReq>
         manifest: req.manifest,
         image: req.image,
         timeout: req.timeout,
+        cpus: req.cpus,
+        mem: req.mem,
         force: req.force,
         chat_session_id: req.chat_session_id,
         agent_origin: req.agent_origin,
@@ -8628,6 +8636,8 @@ mod tests {
             manifest: None,
             image: None,
             timeout: None,
+            cpus: Some(8),
+            mem: Some("64G".into()),
             org: None,
             provider: None,
             disk: None,
@@ -8640,6 +8650,8 @@ mod tests {
         assert_eq!(value["experimentId"], "experiment-1");
         assert_eq!(value["chatSessionId"], "session-1");
         assert_eq!(value["force"], true);
+        assert_eq!(value["cpus"], 8);
+        assert_eq!(value["mem"], "64G");
         assert_eq!(
             serde_json::from_value::<CreateRunReq>(value).unwrap(),
             request

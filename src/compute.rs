@@ -683,6 +683,17 @@ pub fn validate_run_args(args: &crate::ExpRunArgs) -> Result<()> {
             }
         }
     }
+    if (args.cpus.is_some() || args.mem.is_some()) && args.backend.as_deref() != Some("slurm") {
+        return Err(anyhow!(
+            "--cpus/--mem only apply with --backend slurm. Size other backends with --flavor."
+        ));
+    }
+    if args.cpus == Some(0) {
+        return Err(anyhow!("--cpus must be at least 1."));
+    }
+    if let Some(mem) = &args.mem {
+        crate::jobs::slurm::parse_mem(mem)?;
+    }
     if (args.container.is_some() || args.no_container) && args.backend.as_deref() != Some("ssh") {
         return Err(anyhow!(
             "--container and --no-container only apply with --backend ssh."
@@ -788,6 +799,8 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         ssh_port: None,
         ssh_user: None,
         timeout_secs: None,
+        cpus_per_task: None,
+        mem: None,
         source_digest: None,
         source_path: None,
         source_size: None,
@@ -1085,6 +1098,35 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn slurm_resources_are_rejected_on_every_other_backend() {
+        let mut args = tinker_args();
+        for backend in crate::local::BACKENDS
+            .iter()
+            .filter(|backend| **backend != "slurm")
+        {
+            args.backend = Some(backend.to_string());
+            for (cpus, mem) in [(Some(8), None), (None, Some("64G"))] {
+                args.cpus = cpus;
+                args.mem = mem.map(str::to_string);
+                assert_eq!(
+                    validate_run_args(&args).unwrap_err().to_string(),
+                    "--cpus/--mem only apply with --backend slurm. Size other backends with --flavor.",
+                    "{backend}"
+                );
+            }
+        }
+        args.backend = Some("slurm".into());
+        args.cpus = Some(8);
+        args.mem = Some("64G".into());
+        assert!(validate_run_args(&args).is_ok());
+        args.cpus = Some(0);
+        assert!(validate_run_args(&args).is_err());
+        args.cpus = None;
+        args.mem = Some("64GB".into());
+        assert!(validate_run_args(&args).is_err());
+    }
+
     pub(crate) fn tinker_args() -> crate::ExpRunArgs {
         crate::ExpRunArgs {
             exp_id: "exp".into(),
@@ -1099,6 +1141,8 @@ pub(crate) mod tests {
             manifest: None,
             image: None,
             timeout: None,
+            cpus: None,
+            mem: None,
             force: false,
             chat_session_id: None,
             invocation_context: None,
