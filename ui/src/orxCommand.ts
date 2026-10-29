@@ -37,8 +37,8 @@ function detectPaperSource(id: string): LitSource {
   return "alphaxiv";
 }
 
-/** Shell-style tokens up to the first operator, including Codex's quoted argv display. */
-export function shellWords(input: string): string[] {
+/** Shell-style tokens; strict parsing rejects incomplete commands and shell operations. */
+export function shellWords(input: string, _hideShellExpansions = false, requireWholeCommand = false): string[] {
   const words: string[] = [];
   let word = "";
   let hasWord = false;
@@ -53,6 +53,11 @@ export function shellWords(input: string): string[] {
   for (let index = 0; index < input.length; index++) {
     const char = input[index];
     if (char === "\\" && quote !== "'") {
+      if (requireWholeCommand && !quote && /^[A-Za-z]:/.test(word)) {
+        word += char;
+        hasWord = true;
+        continue;
+      }
       const next = input[index + 1];
       const escapesInDoubleQuotes = next !== undefined && ["$", "`", '"', "\\", "\n"].includes(next);
       if (quote === '"' && !escapesInDoubleQuotes) {
@@ -61,6 +66,7 @@ export function shellWords(input: string): string[] {
         continue;
       }
       if (next === undefined) {
+        if (requireWholeCommand) throw new SyntaxError("Incomplete escape");
         word += char;
         hasWord = true;
         continue;
@@ -71,6 +77,9 @@ export function shellWords(input: string): string[] {
         hasWord = true;
       }
       continue;
+    }
+    if (requireWholeCommand && quote !== "'" && (char === "`" || (char === "$" && /[A-Za-z_0-9{(?#@$!*-]/.test(input[index + 1] ?? "")))) {
+      throw new SyntaxError("Shell expansion is not a launch argument");
     }
     if (quote) {
       if (char === quote) quote = null;
@@ -83,13 +92,18 @@ export function shellWords(input: string): string[] {
       hasWord = true;
       continue;
     }
-    if (char === "|" || char === ";" || char === ">" || char === "&") break;
+    if (char === "|" || char === ";" || char === ">" || char === "&") {
+      if (requireWholeCommand) throw new SyntaxError("Expected one command");
+      break;
+    }
+    if (requireWholeCommand && "<>()\r\n\0".includes(char)) throw new SyntaxError("Expected one command");
     if (/\s/.test(char)) push();
     else {
       word += char;
       hasWord = true;
     }
   }
+  if (requireWholeCommand && quote) throw new SyntaxError("Unclosed quote");
   push();
   return words;
 }

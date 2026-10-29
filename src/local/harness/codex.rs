@@ -2722,9 +2722,7 @@ async fn run_turn_app_server(ctx: &mut TurnCtx) -> Result<()> {
     // resume by message — the next user message replaces them, exactly like
     // Claude's precedent. Behavior-preserving for the pre-plan-mode cards (all
     // of which were native).
-    ctx.host
-        .resolve_stale_prompts(&ctx.session_id, true)
-        .await?;
+    ctx.host.resolve_stale_prompts(&ctx.session_id, true)?;
     let (repo, playbook_md) = codex_playbook(&ctx.project, &ctx.session_id).await?;
 
     let native_session = match ctx.native_session_id.as_deref() {
